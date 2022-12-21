@@ -1,0 +1,16 @@
+[package]
+name = "invoice2storage"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+anyhow = "1.0.68"
+base64 = "0.20.0"
+clap = { version = "4.0.29", features = ["derive", "cargo", "string"] }
+lazy_static = "1.4.0"
+log = "0.4.17"
+mailparse = "0.14.0"
+object_store = { version = "0.5.2", features = ["aws", "gcp", "azure"] }
+tokio = "1.23.0"

@@ -1,0 +1,19 @@
+{
+	"version": "2.0.0",
+	"tasks": [
+		{
+			"type": "shell",
+			"command": "${workspaceFolder}/scripts/nix-cargo",
+			"args": ["build"],
+			"problemMatcher": {
+				"base": "$rustc",
+				"fileLocation": ["relative", "${workspaceRoot}"],
+			},
+			"group": "build",
+			"label": "nix: cargo build"
+		}
+	]
+}
+
+
+

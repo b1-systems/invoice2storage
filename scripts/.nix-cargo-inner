@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+SCCACHE=$(which sccache)
+export RUSTC_WRAPPER=$SCCACHE
+export CC="$SCCACHE gcc"
+export CPP="$SCCACHE g++"
+echo ${@:1}
+exec cargo ${@:1}

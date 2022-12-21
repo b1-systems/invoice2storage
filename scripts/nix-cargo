@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+set -x
+SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )
+ROOT=$(realpath $SCRIPT_DIR/..)
+exec nix --no-warn-dirty develop $ROOT --command $ROOT/scripts/.nix-cargo-inner ${@:1}
