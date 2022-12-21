@@ -2,25 +2,24 @@
 // license: GPLv3+, http://www.gnu.org/licenses/gpl-3.0.html
 // author: Daniel Poelzleithner <poelzleithner@b1-systems.de>, 2022
 
-/// Parses the email from file or stdin. Extracts all pdf attachments 
+/// Parses the email from file or stdin. Extracts all pdf attachments
 /// and uploads the file to a cloud storage or local path
-
 extern crate base64;
 extern crate mailparse;
 
 #[macro_use]
 extern crate log;
 
-use clap::{command, arg, value_parser, ArgMatches};
+use anyhow::Result;
+use clap::{arg, command, value_parser, Arg, ArgMatches};
 use mailparse::*;
 use std::cell::RefCell;
 use std::fmt::Display;
-use std::str::FromStr;
-use std::{fs::File, cell::Cell};
-use std::path::PathBuf;
-use std::string::*;
 use std::io::prelude::*;
-use anyhow::{Result};
+use std::path::PathBuf;
+use std::str::FromStr;
+use std::string::*;
+use std::{cell::Cell, fs::File};
 use tokio;
 
 // lazy_static! {
@@ -29,9 +28,7 @@ use tokio;
 //     ]);
 // }
 
-const DEFAULT_EXTRACT_MIMES: [&'static str; 1] = [
-    "application/pdf"
-];
+const DEFAULT_EXTRACT_MIMES: [&'static str; 1] = ["application/pdf"];
 const UNKNOWN_USER_DEFAULT: &'static str = "_UNKNOWN";
 const ACCEPTED_MIMETYPES: &'static str = "accepted_mimetypes";
 
@@ -81,7 +78,7 @@ impl Into<clap::builder::OsStr> for MimeArguments {
 //    /// Path to save extensions to
 //    #[arg(long)]
 //    local_path: Option<PathBuf>,
-   
+
 //    #[arg(long, default_value_t = DEFAULT_EXTRACT_MIME)]
 //    accepted_mimetypes: MimeArguments,
 
@@ -89,13 +86,16 @@ impl Into<clap::builder::OsStr> for MimeArguments {
 //    file: String,
 // }
 
-async fn extract_files(content: &str, args: &ArgMatches) -> Result<(Option<String>, Vec<String>, u32)> {
+async fn extract_files(
+    content: &str,
+    args: &ArgMatches,
+) -> Result<(Option<String>, Vec<String>, u32)> {
     let parsed = parse_mail(content.as_bytes()).unwrap();
 
     let mut files = Vec::new();
     let mut user: Option<String> = None;
     let mut errors = 0;
-    
+
     let mut unknown = 0;
 
     let output = create_object_store(args)?;
@@ -115,8 +115,8 @@ async fn extract_files(content: &str, args: &ArgMatches) -> Result<(Option<Strin
                                 user = Some(only_name[0].to_string());
                             }
                         }
-                    },
-                    _ => unimplemented!()
+                    }
+                    _ => unimplemented!(),
                 }
             }
         }
@@ -128,17 +128,22 @@ async fn extract_files(content: &str, args: &ArgMatches) -> Result<(Option<Strin
             let dispos = &subpart.get_content_disposition();
             if dispos.disposition == DispositionType::Attachment {
                 println!("{:?}", dispos.params);
-                let filename: String = dispos.params
+                let filename: String = dispos
+                    .params
                     .get("filename")
-                        .map(|x| x.clone())
-                        .unwrap_or_else(||{
-                            unknown += 1;
-                            format!("attachment-{}", unknown)});
+                    .map(|x| x.clone())
+                    .unwrap_or_else(|| {
+                        unknown += 1;
+                        format!("attachment-{}", unknown)
+                    });
                 // output filename
-                let path = format!("{}/{}",
-                    user.as_ref().unwrap_or(&args.get_one("unknown_user").unwrap()),
-                    &filename);
-                
+                let path = format!(
+                    "{}/{}",
+                    user.as_ref()
+                        .unwrap_or(&args.get_one("unknown_user").unwrap()),
+                    &filename
+                );
+
                 // write to backend store
                 log::info!("Save file: {}", &path);
                 let body = subpart.get_body_raw();
@@ -149,18 +154,19 @@ async fn extract_files(content: &str, args: &ArgMatches) -> Result<(Option<Strin
                     log::warn!("Can't get body of attachment: {}", body.err().unwrap());
                     errors += 1;
                 }
-
             }
         }
     }
-    
+
     Ok((user, files, errors))
 }
 
 /// Creates the object_store to save objects to.
 fn create_object_store(args: &ArgMatches) -> Result<Box<dyn object_store::ObjectStore>> {
     if let Some(lpath) = args.get_one::<PathBuf>("local_path") {
-        return Ok(Box::new(object_store::local::LocalFileSystem::new_with_prefix(lpath)?));
+        return Ok(Box::new(
+            object_store::local::LocalFileSystem::new_with_prefix(lpath)?,
+        ));
     }
     anyhow::bail!("Please specify storage backend");
 }
@@ -168,27 +174,32 @@ fn create_object_store(args: &ArgMatches) -> Result<Box<dyn object_store::Object
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
     //let args = Args::parse();
-//    /// Folder name for unknown user
-//    #[arg(long, default_value_t = {"_unknown".to_string()})]
-//    unknown_user: String,
+    //    /// Folder name for unknown user
+    //    #[arg(long, default_value_t = {"_unknown".to_string()})]
+    //    unknown_user: String,
 
-//    /// Path to save extensions to
-//    #[arg(long)]
-//    local_path: Option<PathBuf>,
-   
-//    #[arg(long, default_value_t = DEFAULT_EXTRACT_MIME)]
-//    accepted_mimetypes: MimeArguments,
+    //    /// Path to save extensions to
+    //    #[arg(long)]
+    //    local_path: Option<PathBuf>,
 
-//    #[arg(default_value_t = {"-".into()})]
-//    file: String,
+    //    #[arg(long, default_value_t = DEFAULT_EXTRACT_MIME)]
+    //    accepted_mimetypes: MimeArguments,
 
-    let mut extract_mimes = MimeArguments(DEFAULT_EXTRACT_MIMES.iter().map(|v| v.to_string()).collect::<Vec<String>>());
+    //    #[arg(default_value_t = {"-".into()})]
+    //    file: String,
+
+    let mut extract_mimes = MimeArguments(
+        DEFAULT_EXTRACT_MIMES
+            .iter()
+            .map(|v| v.to_string())
+            .collect::<Vec<String>>(),
+    );
 
     let matches = command!() // requires `cargo` feature
         .arg(
             arg!(--unknown_user <NAME> "Name if user can't be identified")
-            .default_value(UNKNOWN_USER_DEFAULT)
-            .required(false),
+                .default_value(UNKNOWN_USER_DEFAULT)
+                .required(false),
         )
         .arg(
             arg!(
@@ -211,13 +222,24 @@ async fn main() {
             .required(false)
             .default_value("-"),
         )
-        .arg(arg!(
-            -d --debug ... "Turn debugging information on"
-            )
-            .action(clap::ArgAction::SetTrue))
+        .arg(
+            Arg::new("verbosity")
+                .short('v')
+                .action(clap::ArgAction::Count)
+                .help("Increase message verbosity"),
+        )
+        .arg(Arg::new("quiet").short('q').help("Silence all output"))
         .get_matches();
 
+    let verbose = matches.get_count("verbosity") as usize;
+    let quiet = matches.get_one::<String>("quiet").is_some();
 
+    stderrlog::new()
+        .module(module_path!())
+        .quiet(quiet)
+        .verbosity(verbose)
+        .init()
+        .unwrap();
     // let cfg = App::new("prog")
     //         .arg(Arg::with_name("unknown_user")
     //                 .long("unknown_user")
@@ -227,11 +249,11 @@ async fn main() {
 
     let mut content: String = String::new();
 
-    if matches.get_flag("debug") {
-        log::set_max_level(log::LevelFilter::Debug);
-    } else {
-        log::set_max_level(log::LevelFilter::Info);
-    }
+    // if matches.get_flag("debug") {
+    //     log::set_max_level(log::LevelFilter::Debug);
+    // } else {
+    //     log::set_max_level(log::LevelFilter::Info);
+    // }
 
     let file_name = matches.get_one::<String>("FILE").unwrap();
     if file_name == "-" {
@@ -251,7 +273,11 @@ async fn main() {
     let mut move_failed = false;
     match &res {
         Ok((user, files, errors)) => {
-            log::info!("Found {} files for user {}", files.len(), user.clone().unwrap_or("unknown".into()));
+            log::info!(
+                "Found {} files for user {}",
+                files.len(),
+                user.clone().unwrap_or("unknown".into())
+            );
             if errors > &0 {
                 move_failed = true;
             }
