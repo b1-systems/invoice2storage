@@ -11,6 +11,8 @@ extern crate mailparse;
 extern crate log;
 
 use anyhow::Result;
+use backoff::ExponentialBackoff;
+use backoff::backoff::Backoff;
 use clap::{arg, command, Parser};
 use mailparse::*;
 use std::cell::RefCell;
@@ -73,37 +75,30 @@ impl Into<clap::builder::OsStr> for MimeArguments {
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
-   /// Name of the person to greet
-   #[arg(short, long)]
-   name: String,
+    /// Folder name for unknown user
+    #[arg(long, default_value_t = {"_unknown".to_string()})]
+    unknown_user: String,
 
-   /// Folder name for unknown user
-   #[arg(long, default_value_t = {"_unknown".to_string()})]
-   unknown_user: String,
+    #[arg(long, default_value_t={MimeArguments::default()})]
+    accepted_mimetypes: MimeArguments,
 
-   /// Path to save extensions to
-   #[arg(long)]
-   local_path: Option<PathBuf>,
+    #[arg(default_value_t= {"-".into()}, help = "File to extract")]
+    file: String,
 
-   #[arg(long, default_value_t={MimeArguments::default()})]
-   accepted_mimetypes: MimeArguments,
+    #[arg(long, short, action=clap::ArgAction::Count, default_value_t=1, help = "Increase verbosity")]
+    verbose: u8,
 
-   #[arg(default_value_t= {"-".into()}, help = "File to extract")]
-   file: String,
+    #[arg(long, short, action=clap::ArgAction::SetTrue, help = "Silence all output")]
+    quiet: bool,
 
-   #[arg(action=clap::ArgAction::Count, help = "Increase verbosity")]
-   verbose: usize,
+    // Output options
+    /// Local path to save extensions to
+    #[arg(long, env="LOCAL_PATH")]
+    local_path: Option<PathBuf>,
 
-   #[arg(action=clap::ArgAction::SetTrue, help = "Silence all output")]
-   quiet: bool,
-    //     .arg(
-    //         Arg::new("verbosity")
-    //             .short('v')
-    //             .action(clap::ArgAction::Count)
-    //             .help("Increase message verbosity"),
-    //     )
-    //     .arg(Arg::new("quiet").short('q').help("Silence all output"))
-    //)]
+    /// Store extensions at webdav target
+    #[arg(long, env="HTTP_PATH")]
+    http_path: Option<String>,
 
 }
 
@@ -143,6 +138,7 @@ async fn extract_files(
         }
     }
 
+    let mut retry_backoff = backoff::ExponentialBackoff::default();
     for subpart in parsed.subparts.iter() {
         //let mimes = args.accepted_mimetypes.0;
         if args.accepted_mimetypes.0.contains(&subpart.ctype.mimetype) {
@@ -169,8 +165,32 @@ async fn extract_files(
                 log::info!("Save file: {}", &path);
                 let body = subpart.get_body_raw();
                 if let Ok(body_vec) = body {
-                    let success = output.put(&path.clone().into(), body_vec.into()).await;
-                    files.push(path);
+                    loop {
+                        let success = output.put(&path.clone().into(), body_vec.clone().into()).await;
+                        match success {
+                            Ok(_) => {
+                                files.push(path);
+                                retry_backoff.reset();
+                                break;
+                            },
+                            Err(e) => {
+                                errors += 1;
+                                let wait = retry_backoff.next_backoff();
+                                log::warn!("Error storing file: {}", e);
+                                match wait {
+                                    Some(wait) => {
+                                        log::info!("Retry in: {} seconds", wait.as_secs());
+                                        tokio::time::sleep(wait).await
+                                    },
+                                    None => {
+                                        log::error!("Maximum number of retries reached.");
+                                        errors += 1;
+                                        break;
+                                    }
+                                }
+                            }
+                        };
+                    }
                 } else {
                     log::warn!("Can't get body of attachment: {}", body.err().unwrap());
                     errors += 1;
@@ -254,6 +274,11 @@ fn create_object_store(args: &Args) -> Result<Box<dyn object_store::ObjectStore>
         return Ok(Box::new(
             object_store::local::LocalFileSystem::new_with_prefix(local_path)?,
         ));
+    } else if let Some(http_path) = &args.http_path {
+        let store = object_store::http::HttpBuilder::new().
+            with_url(http_path).
+            build()?;
+        return Ok(Box::new(store));
     }
     anyhow::bail!("Please specify storage backend");
 }
@@ -324,7 +349,8 @@ async fn main() {
     stderrlog::new()
         .module(module_path!())
         .quiet(args.quiet)
-        .verbosity(args.verbose)
+        .verbosity(args.verbose as usize)
+        .timestamp(stderrlog::Timestamp::Second)
         .init()
         .unwrap();
     // let cfg = App::new("prog")

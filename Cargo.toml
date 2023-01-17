@@ -7,11 +7,12 @@ edition = "2021"
 
 [dependencies]
 anyhow = "1.0.68"
+backoff = { version = "0.4.0"}
 base64 = "0.20.0"
-clap = { version = "4.0.29", features = ["cargo", "string", "derive"] }
+clap = { version = "4.0.29", features = ["cargo", "string", "derive", "env"] }
 lazy_static = "1.4.0"
 log = "0.4.17"
 mailparse = "0.14.0"
-object_store = { version = "0.5.2", features = ["aws", "gcp", "azure"] }
+object_store = { version = "0.5.3", features = ["aws", "gcp", "azure", "http"] }
 stderrlog = "0.5.4"
 tokio = "1.23.0"
