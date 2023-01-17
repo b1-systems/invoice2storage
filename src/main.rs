@@ -11,7 +11,7 @@ extern crate mailparse;
 extern crate log;
 
 use anyhow::Result;
-use clap::{arg, command, value_parser, Arg, ArgMatches};
+use clap::{arg, command, Parser};
 use mailparse::*;
 use std::cell::RefCell;
 use std::fmt::Display;
@@ -30,7 +30,6 @@ use tokio;
 
 const DEFAULT_EXTRACT_MIMES: [&'static str; 1] = ["application/pdf"];
 const UNKNOWN_USER_DEFAULT: &'static str = "_UNKNOWN";
-const ACCEPTED_MIMETYPES: &'static str = "accepted_mimetypes";
 
 /// Mimetype argument list
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -49,6 +48,13 @@ impl From<Vec<String>> for MimeArguments {
     }
 }
 
+impl Default for MimeArguments {
+    fn default() -> Self {
+        let inner: Vec<String> = DEFAULT_EXTRACT_MIMES.iter().map(|x| x.to_string()).collect();
+        Self(inner)
+    }
+}
+
 impl FromStr for MimeArguments {
     type Err = anyhow::Error;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
@@ -64,33 +70,48 @@ impl Into<clap::builder::OsStr> for MimeArguments {
 }
 
 // /// Simple program to greet a person
-// #[derive(Parser, Debug)]
-// #[command(author, version, about, long_about = None)]
-// struct Args {
-//    /// Name of the person to greet
-//    #[arg(short, long)]
-//    name: String,
+#[derive(Parser, Debug)]
+#[command(author, version, about, long_about = None)]
+struct Args {
+   /// Name of the person to greet
+   #[arg(short, long)]
+   name: String,
 
-//    /// Folder name for unknown user
-//    #[arg(long, default_value_t = {"_unknown".to_string()})]
-//    unknown_user: String,
+   /// Folder name for unknown user
+   #[arg(long, default_value_t = {"_unknown".to_string()})]
+   unknown_user: String,
 
-//    /// Path to save extensions to
-//    #[arg(long)]
-//    local_path: Option<PathBuf>,
+   /// Path to save extensions to
+   #[arg(long)]
+   local_path: Option<PathBuf>,
 
-//    #[arg(long, default_value_t = DEFAULT_EXTRACT_MIME)]
-//    accepted_mimetypes: MimeArguments,
+   #[arg(long, default_value_t={MimeArguments::default()})]
+   accepted_mimetypes: MimeArguments,
 
-//    #[arg(default_value_t = {"-".into()})]
-//    file: String,
-// }
+   #[arg(default_value_t= {"-".into()}, help = "File to extract")]
+   file: String,
+
+   #[arg(action=clap::ArgAction::Count, help = "Increase verbosity")]
+   verbose: usize,
+
+   #[arg(action=clap::ArgAction::SetTrue, help = "Silence all output")]
+   quiet: bool,
+    //     .arg(
+    //         Arg::new("verbosity")
+    //             .short('v')
+    //             .action(clap::ArgAction::Count)
+    //             .help("Increase message verbosity"),
+    //     )
+    //     .arg(Arg::new("quiet").short('q').help("Silence all output"))
+    //)]
+
+}
 
 async fn extract_files(
-    content: &str,
-    args: &ArgMatches,
+    parsed: &ParsedMail<'_>,
+    args: &Args,
 ) -> Result<(Option<String>, Vec<String>, u32)> {
-    let parsed = parse_mail(content.as_bytes()).unwrap();
+
 
     let mut files = Vec::new();
     let mut user: Option<String> = None;
@@ -123,8 +144,8 @@ async fn extract_files(
     }
 
     for subpart in parsed.subparts.iter() {
-        let mimes = args.get_one::<MimeArguments>(ACCEPTED_MIMETYPES).unwrap();
-        if mimes.0.contains(&subpart.ctype.mimetype) {
+        //let mimes = args.accepted_mimetypes.0;
+        if args.accepted_mimetypes.0.contains(&subpart.ctype.mimetype) {
             let dispos = &subpart.get_content_disposition();
             if dispos.disposition == DispositionType::Attachment {
                 println!("{:?}", dispos.params);
@@ -140,7 +161,7 @@ async fn extract_files(
                 let path = format!(
                     "{}/{}",
                     user.as_ref()
-                        .unwrap_or(&args.get_one("unknown_user").unwrap()),
+                        .unwrap_or(&args.unknown_user),
                     &filename
                 );
 
@@ -161,11 +182,77 @@ async fn extract_files(
     Ok((user, files, errors))
 }
 
+/// Extracts the target username from the message argument
+/// It tries:
+/// 1. Extract username from the to field: anything+[USERNAME]@something
+/// 2. If To and From domains match, use the from username
+pub fn extract_user(message: &ParsedMail) -> Option<String> {
+    // check the to to field for result
+    if let Some(to) = message.headers.get_first_value("to") {
+        if let Ok(parsed_addr) = mailparse::addrparse(&to) {
+            if parsed_addr.len() > 0 {
+                match &parsed_addr[0] {
+                    MailAddr::Single(info) => {
+                        let v: Vec<&str> = info.addr.split_terminator('+').collect();
+                        if v.len() == 2 {
+                            // substring before @
+                            let only_name: Vec<&str> = v[1].split_terminator('@').collect();
+                            if only_name.len() == 2 {
+                                return Some(only_name[0].to_string());
+                            }
+                        }
+                    }
+                    _ => unimplemented!(),
+                }
+            }
+        }
+        // extract user from from field if domains match
+        if let Some(from_) = message.headers.get_first_value("from") {
+            let parsed_from = mailparse::addrparse(&from_);
+            let parsed_to = mailparse::addrparse(&to);
+            if let (Ok(from_list), Ok(to_list)) = (parsed_to, parsed_from) {
+                if from_list.len() > 0 && to_list.len() > 0 {
+                    // extract domain names
+                    let from_domain = match &from_list[0] {
+                        MailAddr::Single(info) => {
+                            info.addr.rsplit('@').nth(0)
+                        }
+                        _ => None,
+                    };
+                    let to_domain = match &to_list[0] {
+                        MailAddr::Single(info) => {
+                            info.addr.rsplit('@').nth(0)
+                        }
+                        _ => None,
+                    };
+                    // in case both domains match, extract from username
+                    if let (Some(to_domain), Some(from_domain)) = (to_domain, from_domain) {
+                        // extract the user from
+                        if to_domain == from_domain {
+                            if let Some(user) = match &from_list[0] {
+                                MailAddr::Single(info) => {
+                                    info.addr.split('@').nth(0).and_then(|addr| addr.split("+").nth(0))
+                                }
+                                _ => None,
+                            } {
+                                return Some(user.to_string());
+                            }
+                        }
+                    }
+                } else {
+                    log::error!("To and From are empty");
+                }
+            }
+        }
+    };
+    None
+}
+
 /// Creates the object_store to save objects to.
-fn create_object_store(args: &ArgMatches) -> Result<Box<dyn object_store::ObjectStore>> {
-    if let Some(lpath) = args.get_one::<PathBuf>("local_path") {
+fn create_object_store(args: &Args) -> Result<Box<dyn object_store::ObjectStore>> {
+    if let Some(local_path) = &args.local_path {
         return Ok(Box::new(
-            object_store::local::LocalFileSystem::new_with_prefix(lpath)?,
+            object_store::local::LocalFileSystem::new_with_prefix(local_path)?,
         ));
     }
     anyhow::bail!("Please specify storage backend");
@@ -173,7 +260,7 @@ fn create_object_store(args: &ArgMatches) -> Result<Box<dyn object_store::Object
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
-    //let args = Args::parse();
+    let args = Args::parse();
     //    /// Folder name for unknown user
     //    #[arg(long, default_value_t = {"_unknown".to_string()})]
     //    unknown_user: String,
@@ -195,49 +282,49 @@ async fn main() {
             .collect::<Vec<String>>(),
     );
 
-    let matches = command!() // requires `cargo` feature
-        .arg(
-            arg!(--unknown_user <NAME> "Name if user can't be identified")
-                .default_value(UNKNOWN_USER_DEFAULT)
-                .required(false),
-        )
-        .arg(
-            arg!(
-                --local_path <PATH> "Name if user can't be identified"
-            )
-            .value_parser(value_parser!(PathBuf)),
-        )
-        .arg(
-            arg!(
-                --accepted_mimetypes <ACCEPTED_MIMETYPES> "List of mimetypes to accept"
-            )
-            .required(false)
-            .default_value(extract_mimes)
-            .value_parser(MimeArguments::from_str),
-        )
-        .arg(
-            arg!(
-                [FILE] "File to parse, - for stdin"
-            )
-            .required(false)
-            .default_value("-"),
-        )
-        .arg(
-            Arg::new("verbosity")
-                .short('v')
-                .action(clap::ArgAction::Count)
-                .help("Increase message verbosity"),
-        )
-        .arg(Arg::new("quiet").short('q').help("Silence all output"))
-        .get_matches();
+    // let matches = command!() // requires `cargo` feature
+    //     .arg(
+    //         arg!(--unknown_user <NAME> "Name if user can't be identified")
+    //             .default_value(UNKNOWN_USER_DEFAULT)
+    //             .required(false),
+    //     )
+    //     .arg(
+    //         arg!(
+    //             --local_path <PATH> "Name if user can't be identified"
+    //         )
+    //         .value_parser(value_parser!(PathBuf)),
+    //     )
+    //     .arg(
+    //         arg!(
+    //             --accepted_mimetypes <ACCEPTED_MIMETYPES> "List of mimetypes to accept"
+    //         )
+    //         .required(false)
+    //         .default_value(extract_mimes)
+    //         .value_parser(MimeArguments::from_str),
+    //     )
+    //     .arg(
+    //         arg!(
+    //             [FILE] "File to parse, - for stdin"
+    //         )
+    //         .required(false)
+    //         .default_value("-"),
+    //     )
+    //     .arg(
+    //         Arg::new("verbosity")
+    //             .short('v')
+    //             .action(clap::ArgAction::Count)
+    //             .help("Increase message verbosity"),
+    //     )
+    //     .arg(Arg::new("quiet").short('q').help("Silence all output"))
+    //     .get_matches();
 
-    let verbose = matches.get_count("verbosity") as usize;
-    let quiet = matches.get_one::<String>("quiet").is_some();
+    // let verbose = matches.get_count("verbosity") as usize;
+    // let quiet = matches.get_one::<String>("quiet").is_some();
 
     stderrlog::new()
         .module(module_path!())
-        .quiet(quiet)
-        .verbosity(verbose)
+        .quiet(args.quiet)
+        .verbosity(args.verbose)
         .init()
         .unwrap();
     // let cfg = App::new("prog")
@@ -255,7 +342,7 @@ async fn main() {
     //     log::set_max_level(log::LevelFilter::Info);
     // }
 
-    let file_name = matches.get_one::<String>("FILE").unwrap();
+    let file_name = &args.file;
     if file_name == "-" {
         let res = std::io::stdin().lock().read_to_string(&mut content);
         if res.is_err() {
@@ -268,24 +355,79 @@ async fn main() {
             log::error!("Can't read stdin: {}", res.err().unwrap());
         }
     }
+    let parsed = parse_mail(content.as_bytes());
 
-    let res = extract_files(&content, &matches).await;
     let mut move_failed = false;
-    match &res {
-        Ok((user, files, errors)) => {
-            log::info!(
-                "Found {} files for user {}",
-                files.len(),
-                user.clone().unwrap_or("unknown".into())
-            );
-            if errors > &0 {
-                move_failed = true;
-            }
-        }
+
+    match parsed {
+        Ok(message) => {
+            let res = extract_files(&message, &args).await;
+            match &res {
+                Ok((user, files, errors)) => {
+                    log::info!(
+                        "Found {} files for user {}",
+                        files.len(),
+                        user.clone().unwrap_or(UNKNOWN_USER_DEFAULT.into())
+                    );
+                    if errors > &0 {
+                        move_failed = true;
+                    }
+                }
+                Err(e) => {
+                    log::error!("Error: {}", e);
+                    move_failed = true;
+                }
+            };
+        },
         Err(e) => {
-            log::error!("Error: {}", e);
+            log::error!("Error, can't parse mime email: {}", e);
+            move_failed = true;
         }
     };
 
+
     // copy message to imap
+}
+
+
+
+#[cfg(test)]
+mod tests{
+    use super::*;
+
+    #[test]
+    fn test_user_extraction() {
+        macro_rules! test_user {
+            ($m:expr, None) => {
+                    let msg1 = parse_mail($m.as_ref()).unwrap();
+                    assert_eq!(extract_user(&msg1),
+                    None);
+            };
+            ($m:expr, $exp:expr) => {
+                        let msg1 = parse_mail($m.as_ref()).unwrap();
+                        assert_eq!(extract_user(&msg1),
+                            Some($exp.to_string()));
+                        };
+        }
+        test_user!(r#"
+            From: test@example.com
+            To: office@example.com
+            "#,
+            "test");
+        test_user!(r#"
+            From: test@test.com
+            To: office@example.com
+            "#,
+            None);
+        test_user!(r#"
+            From: test+user1@test.com
+            To: office@example.com
+            "#,
+            "user1");
+        test_user!(r#"
+            From: foo+user1@example.com
+            To: office@example.com
+            "#,
+            "foo");
+    }
 }

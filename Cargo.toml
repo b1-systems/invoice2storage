@@ -8,7 +8,7 @@ edition = "2021"
 [dependencies]
 anyhow = "1.0.68"
 base64 = "0.20.0"
-clap = { version = "4.0.29", features = ["cargo", "string"] }
+clap = { version = "4.0.29", features = ["cargo", "string", "derive"] }
 lazy_static = "1.4.0"
 log = "0.4.17"
 mailparse = "0.14.0"
