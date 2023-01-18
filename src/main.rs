@@ -10,22 +10,19 @@ extern crate mailparse;
 #[macro_use]
 extern crate log;
 
-use serde::Serialize;
-
 use anyhow::Result;
-use backoff::ExponentialBackoff;
 use backoff::backoff::Backoff;
 use clap::{arg, command, Parser};
 use mailparse::*;
-use std::cell::RefCell;
+use tera::{Context, Value, Tera};
+use std::collections::HashMap;
 use std::fmt::Display;
 use std::io::prelude::*;
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::string::*;
-use std::{cell::Cell, fs::File};
+use std::{fs::File};
 use tokio;
-use tinytemplate::{self, TinyTemplate};
 
 // lazy_static! {
 //     static ref DEFAULT_EXTRACT_MIME: MimeArguments = MimeArguments(vec![
@@ -36,7 +33,8 @@ use tinytemplate::{self, TinyTemplate};
 const DEFAULT_EXTRACT_MIMES: [&'static str; 1] = ["application/pdf"];
 const UNKNOWN_USER_DEFAULT: &'static str = "_UNKNOWN";
 const UNKNOWN_FROM_DEFAULT: &'static str = "UNKNOWN";
-const DEFAULT_PATH_TEMPLATE: &'static str = "{user}/{file_name}";
+const DEFAULT_PATH_TEMPLATE: &'static str = "{{user | lower}}/{{file_name | escape_filename}}";
+const DEFAULT_IMAP_FOLDER: &'static str = "{{user | lower}}.new";
 
 
 /// Mimetype argument list
@@ -110,14 +108,39 @@ struct Args {
     #[arg(long, env, default_value_t = DEFAULT_PATH_TEMPLATE.to_owned(), help = "template for file output")]
     output_template: String,
 
+    /// Imap target folder
+    #[arg(long, env, default_value_t = DEFAULT_IMAP_FOLDER.to_owned(), help = "IMAP output folder")]
+    imap_template: String,
 }
 
-#[derive(Serialize)]
-struct TemplateContext {
-    user: String,
-    from: String,
-    file_name: String,
-    file_size: usize,
+/// Returns the given text that is safe to use as a filename.
+/// The returned filename is safe on all major platforms.
+pub fn escape_filename(value: &Value, _: &HashMap<String, Value>) -> tera::Result<Value> {
+    let s = tera::try_get_value!("escape_filename", "value", String, value);
+
+    let mut output = String::with_capacity(s.len() * 2);
+    for c in s.chars() {
+        match c {
+            token if token.is_control()  => output.push_str("_"),
+            '<' => output.push_str("_"),
+            '>' => output.push_str("_"),
+            ':' => output.push_str("_"),
+            '\"' => output.push_str("_"),
+            '/' => output.push_str("__"),
+            '\\' => output.push_str("__"),
+            '|' => output.push_str("#"),
+            '?' => output.push_str("#"),
+            '*' => output.push_str("#"),
+            _ => output.push(c),
+        }
+    }
+    Ok(Value::String(output))
+}
+
+fn create_template_engine() -> Tera {
+    let mut tt = Tera::empty();
+    tt.register_filter("escape_filename", escape_filename);
+    tt
 }
 
 /// Extract all files from a ParsedMail that match the selected mime types
@@ -136,8 +159,10 @@ async fn extract_files(
     let from_ = parsed.headers.get_first_value("from").unwrap_or(UNKNOWN_FROM_DEFAULT.to_owned());
 
     // output template context
-    let mut tt = TinyTemplate::new();
-    tt.add_template("output", &args.output_template)?;
+    //let mut tt = TinyTemplate::new();
+    //tt.add_template("output", &args.output_template)?;
+    let mut tt = create_template_engine();
+
 
     let output = create_object_store(args)?;
 
@@ -147,10 +172,10 @@ async fn extract_files(
     for subpart in parsed.subparts.iter() {
         //let mimes = args.accepted_mimetypes.0;
         if args.accepted_mimetypes.0.contains(&subpart.ctype.mimetype) {
-            let dispos = &subpart.get_content_disposition();
-            if dispos.disposition == DispositionType::Attachment {
-                println!("{:?}", dispos.params);
-                let filename: String = dispos
+            let content = &subpart.get_content_disposition();
+            if content.disposition == DispositionType::Attachment {
+                println!("{:?}", content.params);
+                let filename: String = content
                     .params
                     .get("filename")
                     .map(|x| x.clone())
@@ -159,12 +184,22 @@ async fn extract_files(
                         format!("attachment-{}", unknown)
                     });
 
-                let context = TemplateContext {
-                    user:  user.to_owned().unwrap_or(args.unknown_user.clone()),
-                    file_name: filename,
-                    from: from_.clone(),
-                    file_size: 0,
+                // let context = TemplateContext {
+                //     user:  user.to_owned().unwrap_or(args.unknown_user.clone()),
+                //     file_name: filename,
+                //     from: from_.clone(),
+                //     file_size: 0,
+                // };
+                let muser = match user {
+                    Some(x) => x,
+                    None => &args.unknown_user,
                 };
+
+                let mut context = Context::new();
+                context.insert("user", muser);
+                context.insert("file_name", &filename);
+                context.insert("from", &from_);
+
 
                 // let path = format!(
                 //     "{}/{}",
@@ -172,7 +207,16 @@ async fn extract_files(
                 //         .unwrap_or(&args.unknown_user),
                 //     &filename
                 // );
-                let path = tt.render("output", &context)?;
+                //let path = tt.render("output", &context)?;
+                let rendered = tt.render_str(&args.output_template, &context);
+                let path = match rendered {
+                    Ok(x) => x,
+                    Err(e) => {
+                        log::error!("Error rendering output path: {}", e);
+                        errors += 1;
+                        continue;
+                    }
+                };
 
                 // write to backend store
                 log::info!("Save file: {}", &path);
@@ -312,14 +356,6 @@ async fn main() {
 
     //    #[arg(default_value_t = {"-".into()})]
     //    file: String,
-
-    let mut extract_mimes = MimeArguments(
-        DEFAULT_EXTRACT_MIMES
-            .iter()
-            .map(|v| v.to_string())
-            .collect::<Vec<String>>(),
-    );
-
     // let matches = command!() // requires `cargo` feature
     //     .arg(
     //         arg!(--unknown_user <NAME> "Name if user can't be identified")
@@ -401,7 +437,7 @@ async fn main() {
     match parsed {
         Ok(message) => {
 
-            let mut user = extract_user(&message);
+            let user = extract_user(&message);
             let res = extract_files(&message, &args, &user).await;
 
             match &res {
@@ -471,5 +507,14 @@ mod tests{
             To: office@example.com
             "#,
             "foo");
+    }
+    #[test]
+    fn test_escape_fn() {
+        let mut tt = create_template_engine();
+        let mut context = Context::new();
+        context.insert("file_name",  "sH\\itty/fIl name.xml");
+        assert_eq!(
+            tt.render_str("{{ file_name | escape_filename}}", &context).unwrap(),
+            "sH__itty__fIl name.xml".to_owned());
     }
 }
