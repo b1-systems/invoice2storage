@@ -10,6 +10,8 @@ extern crate mailparse;
 #[macro_use]
 extern crate log;
 
+use serde::Serialize;
+
 use anyhow::Result;
 use backoff::ExponentialBackoff;
 use backoff::backoff::Backoff;
@@ -23,6 +25,7 @@ use std::str::FromStr;
 use std::string::*;
 use std::{cell::Cell, fs::File};
 use tokio;
+use tinytemplate::{self, TinyTemplate};
 
 // lazy_static! {
 //     static ref DEFAULT_EXTRACT_MIME: MimeArguments = MimeArguments(vec![
@@ -32,6 +35,9 @@ use tokio;
 
 const DEFAULT_EXTRACT_MIMES: [&'static str; 1] = ["application/pdf"];
 const UNKNOWN_USER_DEFAULT: &'static str = "_UNKNOWN";
+const UNKNOWN_FROM_DEFAULT: &'static str = "UNKNOWN";
+const DEFAULT_PATH_TEMPLATE: &'static str = "{user}/{file_name}";
+
 
 /// Mimetype argument list
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -100,43 +106,42 @@ struct Args {
     #[arg(long, env="HTTP_PATH")]
     http_path: Option<String>,
 
+    /// Store extensions at webdav target
+    #[arg(long, env, default_value_t = DEFAULT_PATH_TEMPLATE.to_owned(), help = "template for file output")]
+    output_template: String,
+
 }
 
+#[derive(Serialize)]
+struct TemplateContext {
+    user: String,
+    from: String,
+    file_name: String,
+    file_size: usize,
+}
+
+/// Extract all files from a ParsedMail that match the selected mime types
+/// Returns a list of extracted file names and the number of export errors
 async fn extract_files(
     parsed: &ParsedMail<'_>,
     args: &Args,
-) -> Result<(Option<String>, Vec<String>, u32)> {
+    user: &Option<String>,
+) -> Result<(Vec<String>, u32)> {
 
 
     let mut files = Vec::new();
-    let mut user: Option<String> = None;
     let mut errors = 0;
 
     let mut unknown = 0;
+    let from_ = parsed.headers.get_first_value("from").unwrap_or(UNKNOWN_FROM_DEFAULT.to_owned());
+
+    // output template context
+    let mut tt = TinyTemplate::new();
+    tt.add_template("output", &args.output_template)?;
 
     let output = create_object_store(args)?;
 
-    // parse the user to which this email belongs to
-    // It extracts from the "To: something+user@example.com" the user part
-    if let Some(to) = parsed.headers.get_first_value("to") {
-        if let Ok(parsed_addr) = mailparse::addrparse(&to) {
-            if parsed_addr.len() > 0 {
-                match &parsed_addr[0] {
-                    MailAddr::Single(info) => {
-                        let v: Vec<&str> = info.addr.split_terminator('+').collect();
-                        if v.len() == 2 {
-                            // substring before @
-                            let only_name: Vec<&str> = v[1].split_terminator('@').collect();
-                            if only_name.len() == 2 {
-                                user = Some(only_name[0].to_string());
-                            }
-                        }
-                    }
-                    _ => unimplemented!(),
-                }
-            }
-        }
-    }
+
 
     let mut retry_backoff = backoff::ExponentialBackoff::default();
     for subpart in parsed.subparts.iter() {
@@ -153,13 +158,21 @@ async fn extract_files(
                         unknown += 1;
                         format!("attachment-{}", unknown)
                     });
-                // output filename
-                let path = format!(
-                    "{}/{}",
-                    user.as_ref()
-                        .unwrap_or(&args.unknown_user),
-                    &filename
-                );
+
+                let context = TemplateContext {
+                    user:  user.to_owned().unwrap_or(args.unknown_user.clone()),
+                    file_name: filename,
+                    from: from_.clone(),
+                    file_size: 0,
+                };
+
+                // let path = format!(
+                //     "{}/{}",
+                //     user.as_ref()
+                //         .unwrap_or(&args.unknown_user),
+                //     &filename
+                // );
+                let path = tt.render("output", &context)?;
 
                 // write to backend store
                 log::info!("Save file: {}", &path);
@@ -199,7 +212,7 @@ async fn extract_files(
         }
     }
 
-    Ok((user, files, errors))
+    Ok((files, errors))
 }
 
 /// Extracts the target username from the message argument
@@ -387,9 +400,12 @@ async fn main() {
 
     match parsed {
         Ok(message) => {
-            let res = extract_files(&message, &args).await;
+
+            let mut user = extract_user(&message);
+            let res = extract_files(&message, &args, &user).await;
+
             match &res {
-                Ok((user, files, errors)) => {
+                Ok((files, errors)) => {
                     log::info!(
                         "Found {} files for user {}",
                         files.len(),

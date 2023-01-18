@@ -14,5 +14,8 @@ lazy_static = "1.4.0"
 log = "0.4.17"
 mailparse = "0.14.0"
 object_store = { version = "0.5.3", features = ["aws", "gcp", "azure", "http"] }
+serde = { version = "1.0.152", features = ["derive"] }
+serde_derive = "1.0.152"
 stderrlog = "0.5.4"
+tinytemplate = "1.2.1"
 tokio = "1.23.0"
