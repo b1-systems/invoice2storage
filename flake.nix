@@ -11,8 +11,24 @@
         pkgs = import nixpkgs { inherit system; };
         naersk-lib = pkgs.callPackage naersk { };
       in let
-        deps = with pkgs; [ ];
+        deps = with pkgs; [ openssl ];
         nativeDeps = with pkgs; [pkg-config sccache];
+        testDeps = with pkgs; [webdav-server-rs minio];
+
+        shell-test-server = pkgs.writeShellScriptBin "start-test-server" ''
+    set -xe
+    WORKDIR="''${WORKDIR:-/tmp/invoice2storage}"
+    mkdir -p $WORKDIR
+    truncate -s 0 $WORKDIR/.pids
+    webdav-server -c test-data/webdav/webdav-server.toml &
+    echo $! >> $WORKDIR/.pids
+    minio server /tmp/invoice2storage &
+    echo $! >> $WORKDIR/.pids
+  '';
+        shell-test-server-stop = pkgs.writeShellScriptBin "stop-test-server" ''
+    WORKDIR="''${WORKDIR:-/tmp/invoice2storage}"
+    cat $WORKDIR/.pids | xargs kill -9
+  '';
       in
       {
         defaultPackage = naersk-lib.buildPackage {
@@ -26,7 +42,8 @@
         };
 
         devShell = with pkgs; mkShell {
-          buildInputs = [ pre-commit rustup nixfmt cargo-watch sccache ] ++ nativeDeps ++ deps;
+          buildInputs = deps;
+          nativeBuildInputs = [ pre-commit rustup nixfmt cargo-watch shell-test-server shell-test-server-stop ] ++ nativeDeps ++ testDeps;
           RUST_SRC_PATH = rustPlatform.rustLibSrc;
           LIBCLANG_PATH = "${pkgs.libclang.lib}/lib";
           RUSTC_PATH = "${sccache}/bin/sccache";
