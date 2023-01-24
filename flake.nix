@@ -13,16 +13,21 @@
       in let
         deps = with pkgs; [ openssl ];
         nativeDeps = with pkgs; [pkg-config sccache];
-        testDeps = with pkgs; [webdav-server-rs minio];
+        testDeps = with pkgs; [dave minio mkcert];
 
         shell-test-server = pkgs.writeShellScriptBin "start-test-server" ''
     set -xe
     WORKDIR="''${WORKDIR:-/tmp/invoice2storage}"
     mkdir -p $WORKDIR
+    if [ ! -e "$WORKDIR/.ssl/server.key" ]; then
+      mkdir -p $WORKDIR/.ssl
+      # openssl req  -nodes -new -x509  -keyout $WORKDIR/.ssl/server.key -out $WORKDIR/.ssl/server.crt -subj '/CN=localhost'
+      mkcert localhost -cert-file $WORKDIR/.ssl/server.crt -key-file $WORKDIR/.ssl/server.key
+    fi
     truncate -s 0 $WORKDIR/.pids
-    webdav-server -c test-data/webdav/webdav-server.toml &
+    ${pkgs.dufs}/bin/dufs -A --port 5443 --tls-cert $WORKDIR/.ssl/server.crt --tls-key $WORKDIR/.ssl/server.key $WORKDIR &
     echo $! >> $WORKDIR/.pids
-    minio server /tmp/invoice2storage &
+    ${pkgs.minio}/bin/minio server /tmp/invoice2storage &
     echo $! >> $WORKDIR/.pids
   '';
         shell-test-server-stop = pkgs.writeShellScriptBin "stop-test-server" ''
