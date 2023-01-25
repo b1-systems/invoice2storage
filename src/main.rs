@@ -82,12 +82,15 @@ impl Into<clap::builder::OsStr> for MimeArguments {
     }
 }
 
-// /// Simple program to greet a person
+/// A email processor to extract email attachments and store them on a storage backend.
+/// like webdav, directory, s3, ...
+/// 
+/// All templates are in the tera template. https://tera.netlify.app/
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
-    /// Folder name for unknown user
-    #[arg(long, default_value_t = {"_unknown".to_string()})]
+    /// user name for unknown user
+    #[arg(long, default_value_t = {UNKNOWN_USER_DEFAULT.to_string()})]
     unknown_user: String,
 
     #[arg(long, default_value_t={MimeArguments::default()})]
@@ -114,6 +117,10 @@ struct Args {
     /// Store extensions at webdav target
     #[arg(long, help = "Ignore tls/https errors")]
     insecure: bool,
+
+    /// Overwrite the detected user with specified
+    #[arg(long)]
+    overwrite_user: Option<String>,
 
     /// Store extensions at webdav target
     #[arg(long, help = "Pipe mail to stdout. Useful when used as a pipe filter")]
@@ -485,7 +492,10 @@ async fn main() -> ExitCode {
     match parsed {
         Ok(message) => {
 
-            if let Some(extracted_user) = extract_user(&message) {
+            if let Some(overwrite_user) = &args.overwrite_user {
+                user.clone_from(overwrite_user);
+                user_found = true;
+            } else if let Some(extracted_user) = extract_user(&message) {
                 user = extracted_user;
                 user_found = true;
             };
