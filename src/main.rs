@@ -13,12 +13,15 @@ extern crate log;
 use anyhow::Result;
 use backoff::backoff::Backoff;
 use clap::{arg, command, Parser};
+use himalaya_lib::{AccountConfig, MaildirConfig, BackendBuilder, BackendConfig};
+use maildir::Maildir;
 use mailparse::*;
 use tera::{Context, Value, Tera};
 use std::collections::HashMap;
 use std::fmt::Display;
 use std::io::prelude::*;
-use std::path::PathBuf;
+use std::path::{PathBuf, Path};
+use std::process::ExitCode;
 use std::str::FromStr;
 use std::string::*;
 use std::{fs::File};
@@ -34,7 +37,11 @@ const DEFAULT_EXTRACT_MIMES: [&'static str; 1] = ["application/pdf"];
 const UNKNOWN_USER_DEFAULT: &'static str = "_UNKNOWN";
 const UNKNOWN_FROM_DEFAULT: &'static str = "UNKNOWN";
 const DEFAULT_PATH_TEMPLATE: &'static str = "{{user | lower}}/{{file_name | escape_filename}}";
-const DEFAULT_IMAP_FOLDER: &'static str = "{{user | lower}}.new";
+const DEFAULT_MAIL_TEMPLATE: &'static str = "{{user | lower}}.{% if errors %}new{% else %}done{% endif %}";
+const DEFAULT_MAIL_FLAGS: &'static str = "";
+const ERROR_MAIL_FLAGS: &'static str = "F";
+const FALLBACK_MAIL_TARGET: &'static str = "";
+
 
 
 /// Mimetype argument list
@@ -105,12 +112,28 @@ struct Args {
     http_path: Option<String>,
 
     /// Store extensions at webdav target
-    #[arg(long, env, default_value_t = DEFAULT_PATH_TEMPLATE.to_owned(), help = "template for file output")]
+    #[arg(long, help = "Ignore tls/https errors")]
+    insecure: bool,
+
+    /// Store extensions at webdav target
+    #[arg(long, help = "Pipe mail to stdout. Useful when used as a pipe filter")]
+    stdout: bool,
+
+    /// Target path for generated file
+    #[arg(long, env, default_value_t = DEFAULT_PATH_TEMPLATE.to_owned(), help = "template for file output path")]
     output_template: String,
 
+    /// Maildir output
+    #[arg(long, env="MAILDIR_PATH", help = "Maildir folder to save messages to, instead of imap")]
+    maildir_path: Option<PathBuf>,
+
+    /// Store extensions at webdav target
+    #[arg(long, env="IMAP_URL", help = "IMAP connection url. imaps://user:password@host")]
+    imap_url: Option<String>,
+
     /// Imap target folder
-    #[arg(long, env, default_value_t = DEFAULT_IMAP_FOLDER.to_owned(), help = "IMAP output folder")]
-    imap_template: String,
+    #[arg(long, env, default_value_t = DEFAULT_MAIL_TEMPLATE.to_owned(), help = "Mail template folder")]
+    mail_template: String,
 }
 
 /// Returns the given text that is safe to use as a filename.
@@ -138,7 +161,7 @@ pub fn escape_filename(value: &Value, _: &HashMap<String, Value>) -> tera::Resul
 }
 
 fn create_template_engine() -> Tera {
-    let mut tt = Tera::empty();
+    let mut tt: Tera = Default::default();
     tt.register_filter("escape_filename", escape_filename);
     tt
 }
@@ -332,69 +355,102 @@ fn create_object_store(args: &Args) -> Result<Box<dyn object_store::ObjectStore>
             object_store::local::LocalFileSystem::new_with_prefix(local_path)?,
         ));
     } else if let Some(http_path) = &args.http_path {
-        let store = object_store::http::HttpBuilder::new().
-            with_url(http_path).
-            build()?;
+        let options = object_store::ClientOptions::new()
+            .with_allow_http(true)
+            .with_allow_invalid_certificates(args.insecure);
+        let store = object_store::http::HttpBuilder::new()
+            .with_url(http_path)
+            .with_client_options(options)
+            .build()?;
         return Ok(Box::new(store));
     }
     anyhow::bail!("Please specify storage backend");
 }
 
+fn get_account_info() -> AccountConfig {
+    AccountConfig {
+        email: "test@localhost".into(),
+        display_name: Some("invoice2storage".into()),
+        ..Default::default()
+    }
+}
+
+/// Stores mail in a maildir target
+fn store_to_maildir(path: &Path, content: &str, target: &str, flags: &str) -> Result<()> {
+    //let md = Mailbox::new(path.as_, target.to_owned());
+    let ac = get_account_info();
+    let mdc = MaildirConfig {
+        root_dir: path.to_owned(),
+    };
+    let backend_config = BackendConfig::Maildir(&mdc);
+
+    // write message to maildir backend
+    // let mut backend = BackendBuilder::build(&ac, &backend_config)?;
+    log::debug!("Target maildir folder: {}", target);
+    // let exists = backend.folder_list()
+    //     .map(|x| x.0.into_iter()
+    //         .filter(|f| {println!("{}", &f.name); f.name == target}).count());
+    
+    // create folder if there is no match or error
+    let new_path = if target.len() > 0 {
+        let dirname = format!(".{}", target);
+        let pname = PathBuf::from_str(&dirname)?;
+        path.join(pname)
+    } else {
+        path.to_owned()
+    };
+    log::debug!("Target path {}", new_path.display());
+    let md = Maildir::from(new_path);
+    let _ = md.create_dirs()?;
+
+    let id = md.store_new(content.as_bytes())?;
+    let res = md.move_new_to_cur(&id);
+    let _add_flags = md.add_flags(&id, flags);
+    // if exists.map(|x| x == 0).unwrap_or(true)  {
+    //     log::info!("Target folder does not exist, creating");
+    //     let new_path = if target.len() > 0 {
+    //         let dirname = format!(".{}", target);
+    //         let pname = PathBuf::from_str(&dirname)?;
+    //         path.join(pname)
+    //     } else a
+    //         path.to_owned()
+    //     };
+    //     let md = Maildir::from(new_path);
+    //     let _ = md.create_dirs()?;
+    //     // match backend.folder_add(target) {
+    //     //     Ok(_) => (),
+    //     //     Err(err) => {
+    //     //         anyhow::bail!("Error creating folder: {}", err);
+    //     //     }
+    //     // }
+    // }
+    //let res = backend.email_add(target, content.as_bytes(), flags);
+    match res {
+        Ok(_) => {
+            log::info!("Maildir message was stored: {}", &id);
+            Ok(())
+        },
+        Err(e) => {
+            log::info!("Error storing to Maildir: {}", e);
+            anyhow::bail!(e);
+        }
+    }
+}
+
+/// Checks Args for configured targets and stores mail there
+async fn store_message(args: &Args, content: &str, target: &str, flags: &str) -> Result<()> {
+    if let Some(maildir) = &args.maildir_path {
+        // wrap in async runner
+        return store_to_maildir(maildir.as_path(), content, target, flags);
+    }
+    Ok(())
+}
+
 #[tokio::main(flavor = "current_thread")]
-async fn main() {
+async fn main() -> ExitCode {
     let args = Args::parse();
-    //    /// Folder name for unknown user
-    //    #[arg(long, default_value_t = {"_unknown".to_string()})]
-    //    unknown_user: String,
 
-    //    /// Path to save extensions to
-    //    #[arg(long)]
-    //    local_path: Option<PathBuf>,
-
-    //    #[arg(long, default_value_t = DEFAULT_EXTRACT_MIME)]
-    //    accepted_mimetypes: MimeArguments,
-
-    //    #[arg(default_value_t = {"-".into()})]
-    //    file: String,
-    // let matches = command!() // requires `cargo` feature
-    //     .arg(
-    //         arg!(--unknown_user <NAME> "Name if user can't be identified")
-    //             .default_value(UNKNOWN_USER_DEFAULT)
-    //             .required(false),
-    //     )
-    //     .arg(
-    //         arg!(
-    //             --local_path <PATH> "Name if user can't be identified"
-    //         )
-    //         .value_parser(value_parser!(PathBuf)),
-    //     )
-    //     .arg(
-    //         arg!(
-    //             --accepted_mimetypes <ACCEPTED_MIMETYPES> "List of mimetypes to accept"
-    //         )
-    //         .required(false)
-    //         .default_value(extract_mimes)
-    //         .value_parser(MimeArguments::from_str),
-    //     )
-    //     .arg(
-    //         arg!(
-    //             [FILE] "File to parse, - for stdin"
-    //         )
-    //         .required(false)
-    //         .default_value("-"),
-    //     )
-    //     .arg(
-    //         Arg::new("verbosity")
-    //             .short('v')
-    //             .action(clap::ArgAction::Count)
-    //             .help("Increase message verbosity"),
-    //     )
-    //     .arg(Arg::new("quiet").short('q').help("Silence all output"))
-    //     .get_matches();
-
-    // let verbose = matches.get_count("verbosity") as usize;
-    // let quiet = matches.get_one::<String>("quiet").is_some();
-
+    // configure logging
     stderrlog::new()
         .module(module_path!())
         .quiet(args.quiet)
@@ -402,20 +458,9 @@ async fn main() {
         .timestamp(stderrlog::Timestamp::Second)
         .init()
         .unwrap();
-    // let cfg = App::new("prog")
-    //         .arg(Arg::with_name("unknown_user")
-    //                 .long("unknown_user")
-    //                 .takes_value(true)
-    //                 .value_name("NAME")
-    //                 .help("Name when user can't be determined"));
+
 
     let mut content: String = String::new();
-
-    // if matches.get_flag("debug") {
-    //     log::set_max_level(log::LevelFilter::Debug);
-    // } else {
-    //     log::set_max_level(log::LevelFilter::Info);
-    // }
 
     let file_name = &args.file;
     if file_name == "-" {
@@ -432,39 +477,100 @@ async fn main() {
     }
     let parsed = parse_mail(content.as_bytes());
 
-    let mut move_failed = false;
+    let mut user: String = args.unknown_user.to_owned();
+    let mut user_found = false;
+    let mut has_errors = false;
+    let mut path_name_context = Context::new();
 
     match parsed {
         Ok(message) => {
 
-            let user = extract_user(&message);
-            let res = extract_files(&message, &args, &user).await;
+            if let Some(extracted_user) = extract_user(&message) {
+                user = extracted_user;
+                user_found = true;
+            };
+            let user_option = if user_found {
+                Some(user.clone())
+            } else {
+                None
+            };
+            let res = extract_files(&message, &args, &user_option).await;
+
 
             match &res {
                 Ok((files, errors)) => {
+                    path_name_context.insert("errors", errors);
+                    path_name_context.insert("files", files);
                     log::info!(
                         "Found {} files for user {}",
                         files.len(),
-                        user.clone().unwrap_or(UNKNOWN_USER_DEFAULT.into())
+                        &user
                     );
                     if errors > &0 {
-                        move_failed = true;
+                        has_errors = true;
                     }
                 }
                 Err(e) => {
                     log::error!("Error: {}", e);
-                    move_failed = true;
+                    has_errors = true;
                 }
             };
         },
         Err(e) => {
             log::error!("Error, can't parse mime email: {}", e);
-            move_failed = true;
+            has_errors = true;
         }
     };
+    let _ = path_name_context.insert("has_errors", &has_errors);
+    let _ = path_name_context.insert("user", &user);
+    // calculate the output folder name
+    let mut template = create_template_engine();
+    let target_folder = template.render_str(&args.mail_template, &path_name_context)
+        .unwrap_or_else(|err| {
+            log::error!("Can´t render output folder path: {}. Template was: '{}'", &err, &args.mail_template);
+            log::error!("Fallback folder '{}'", &FALLBACK_MAIL_TARGET);
+            FALLBACK_MAIL_TARGET.to_owned()
+        });
+    let flags = if has_errors { ERROR_MAIL_FLAGS } else { DEFAULT_MAIL_FLAGS };
 
+    // backoff::
+    let mut retry_backoff = backoff::ExponentialBackoff::default();
+    loop {
+        log::debug!("Store message");
+        let store_result = store_message(&args, &content, &target_folder, flags).await;
+        match store_result {
+            Ok(_x) => {
+                break;
+            },
+            Err(e) => {
+                let wait = retry_backoff.next_backoff();
+                log::warn!("Error storing mail: {}", e);
+                match wait {
+                    Some(wait) => {
+                        log::info!("Retry in: {} seconds", wait.as_secs());
+                        tokio::time::sleep(wait).await
+                    },
+                    None => {
+                        log::error!("Maximum number of retries reached.");
+                        break;
+                    }
+                }
+            }
+        };
+    }
 
-    // copy message to imap
+    // pip message if requested
+    if args.stdout {
+        let stdout = std::io::stdout();
+        let mut handle = stdout.lock();
+    
+        let res = handle.write_all(content.as_bytes());
+        if res.is_err() {
+            log::error!("Can't write to stdout: {}", res.err().unwrap());
+            return ExitCode::from(1);
+        }
+    };
+    ExitCode::SUCCESS
 }
 
 
