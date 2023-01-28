@@ -19,8 +19,29 @@ This script is used a a email filter to process incoming invoice emails.
 4. It stores the extracted attachments according in the folder specified by template
 5. It stores the email in the folder and backend configured
 
+## Installation
+
+### Using cargo
+
+```bash
+cargo install invoice2storage
+```
+
+### Using nix flake
+
+You can add this repository to your nixos flake configuration.
+
 ## Configuration
 
 All options are passed as arguments or environment variables if they contain
-security related informations.
+security related information.
 
+## MTA configuration
+
+Most MTA support `.forward` pipe support which allows you to configure invoice2storage like this:
+
+`~/.forward` contains:
+
+```
+|/path/to/invoice2storage --arguments....
+```
