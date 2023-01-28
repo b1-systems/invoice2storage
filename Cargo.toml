@@ -7,10 +7,11 @@ edition = "2021"
 
 [dependencies]
 anyhow = "1.0.68"
+async-imap = { version = "0.6.0", features = ["runtime-tokio"], default-features = false }
+async-native-tls = { version = "0.4.0", default-features = false, features = ["runtime-tokio"] }
 backoff = { version = "0.4.0"}
 base64 = "0.21.0"
 clap = { version = "4.0.29", features = ["cargo", "string", "derive", "env"] }
-himalaya-lib = "0.4.0"
 lazy_static = "1.4.0"
 log = "0.4.17"
 maildir = "0.6.1"
@@ -22,3 +23,4 @@ object_store = { git = "https://github.com/poelzi/arrow-rs", branch = "add-insec
 stderrlog = "0.5.4"
 tera = "1.17.1"
 tokio = "1.23.0"
+url = "2.3.1"

@@ -10,14 +10,16 @@ extern crate mailparse;
 #[macro_use]
 extern crate log;
 
-use anyhow::Result;
+use anyhow::{Result, anyhow, bail, Context};
 use backoff::backoff::Backoff;
 use clap::{arg, command, Parser};
-use himalaya_lib::{AccountConfig, MaildirConfig, BackendBuilder, BackendConfig};
 use maildir::Maildir;
 use mailparse::*;
-use tera::{Context, Value, Tera};
+use tera::{Value, Tera};
+use tokio::sync::oneshot::error;
+use url::Url;
 use std::collections::HashMap;
+use std::error::Error;
 use std::fmt::Display;
 use std::io::prelude::*;
 use std::path::{PathBuf, Path};
@@ -41,8 +43,7 @@ const DEFAULT_MAIL_TEMPLATE: &'static str = "{{user | lower}}.{% if errors %}new
 const DEFAULT_MAIL_FLAGS: &'static str = "";
 const ERROR_MAIL_FLAGS: &'static str = "F";
 const FALLBACK_MAIL_TARGET: &'static str = "";
-
-
+const IMAP_INBOX_PREFIX: &'static str = "INBOX";
 
 /// Mimetype argument list
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -225,7 +226,7 @@ async fn extract_files(
                     None => &args.unknown_user,
                 };
 
-                let mut context = Context::new();
+                let mut context = tera::Context::new();
                 context.insert("user", muser);
                 context.insert("file_name", &filename);
                 context.insert("from", &from_);
@@ -374,23 +375,16 @@ fn create_object_store(args: &Args) -> Result<Box<dyn object_store::ObjectStore>
     anyhow::bail!("Please specify storage backend");
 }
 
-fn get_account_info() -> AccountConfig {
-    AccountConfig {
-        email: "test@localhost".into(),
-        display_name: Some("invoice2storage".into()),
-        ..Default::default()
-    }
-}
+// fn get_account_info() -> AccountConfig {
+//     AccountConfig {
+//         email: "test@localhost".into(),
+//         display_name: Some("invoice2storage".into()),
+//         ..Default::default()
+//     }
+// }
 
 /// Stores mail in a maildir target
 fn store_to_maildir(path: &Path, content: &str, target: &str, flags: &str) -> Result<()> {
-    //let md = Mailbox::new(path.as_, target.to_owned());
-    let ac = get_account_info();
-    let mdc = MaildirConfig {
-        root_dir: path.to_owned(),
-    };
-    let backend_config = BackendConfig::Maildir(&mdc);
-
     // write message to maildir backend
     // let mut backend = BackendBuilder::build(&ac, &backend_config)?;
     log::debug!("Target maildir folder: {}", target);
@@ -444,11 +438,78 @@ fn store_to_maildir(path: &Path, content: &str, target: &str, flags: &str) -> Re
     }
 }
 
+/// Stores mail in a maildir target
+async fn store_to_imap(server: &str, content: &str, target: &str, flags: &str) -> Result<()> {
+    let conn_info = Url::parse(server).context("Can't parse imap target URL")?;
+
+    let domain = conn_info.domain().ok_or_else(|| anyhow!("IMAP server domain is empty"))?;
+    let port = conn_info.port().unwrap_or(993);
+
+    let mut imap_session = if conn_info.scheme().to_lowercase() == "imaps" {
+        let tls = async_native_tls::TlsConnector::new();
+        // we pass in the domain twice to check that the server's TLS
+        // certificate is valid for the domain we're connecting to.
+        let client = async_imap::connect((domain, port), domain, tls).await?;
+    
+        // the client we have here is unauthenticated.
+        // to do anything useful with the e-mails, we need to log in
+        if conn_info.username().len() == 0 {
+            log::error!("IMAP requires a login user and password");
+            return bail!("IMAP user & password required")
+        }
+        let pass = conn_info.password().ok_or(anyhow!("IMAP password not set"))?;
+        let imap_session = client
+            .login(conn_info.username(), pass)
+            .await
+            .map_err(|e| e.0)?;
+        imap_session
+    } else {
+        bail!("Only imaps is supported")
+    };
+
+    let mbox_name = if target.len() == 0 {
+        IMAP_INBOX_PREFIX.to_string()
+    } else {
+        format!("{}.{}", IMAP_INBOX_PREFIX, target)
+    };
+    
+    // we want to fetch the first email in the INBOX mailbox
+    let select = imap_session.select(&mbox_name).await;
+    if let Err(err) = &select {
+        println!("Err {:?}", err);
+        log::info!("Creating target folder:  {}", &mbox_name);
+
+        let create_result = imap_session.create(&mbox_name).await;
+        if let Err(err) = create_result {
+            log::error!("Can't create target folder: {} {}", &mbox_name, err);
+            return Err(anyhow!("Can't create target folder: {}", err));
+        }
+        let select = imap_session.select(&mbox_name).await;
+    }
+    if select.is_err() {
+        log::error!("Creating select imap folder:  {}", &mbox_name);
+        bail!("Creating select imap folder:  {}", &mbox_name)
+    }
+
+    let append = imap_session.append(&mbox_name, content).await;
+    
+    if let Err(err) = append {
+        log::error!("Can't append to target folder: {} {}", &mbox_name, err);
+        bail!("Can't append to target folder: {}", err);
+    }
+
+    Ok(())
+}
+
 /// Checks Args for configured targets and stores mail there
 async fn store_message(args: &Args, content: &str, target: &str, flags: &str) -> Result<()> {
     if let Some(maildir) = &args.maildir_path {
         // wrap in async runner
         return store_to_maildir(maildir.as_path(), content, target, flags);
+    }
+    if let Some(imap_url) = &args.imap_url {
+        // wrap in async runner
+        return store_to_imap(imap_url, content, target, flags).await;
     }
     Ok(())
 }
@@ -487,7 +548,7 @@ async fn main() -> ExitCode {
     let mut user: String = args.unknown_user.to_owned();
     let mut user_found = false;
     let mut has_errors = false;
-    let mut path_name_context = Context::new();
+    let mut path_name_context = tera::Context::new();
 
     match parsed {
         Ok(message) => {
@@ -627,7 +688,7 @@ mod tests{
     #[test]
     fn test_escape_fn() {
         let mut tt = create_template_engine();
-        let mut context = Context::new();
+        let mut context = tera::Context::new();
         context.insert("file_name",  "sH\\itty/fIl name.xml");
         assert_eq!(
             tt.render_str("{{ file_name | escape_filename}}", &context).unwrap(),

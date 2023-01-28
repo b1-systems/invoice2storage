@@ -13,7 +13,7 @@
       in let
         deps = with pkgs; [ openssl ];
         nativeDeps = with pkgs; [pkg-config sccache];
-        testDeps = with pkgs; [dave minio mkcert];
+        testDeps = with pkgs; [dave minio mkcert dovecot];
 
         shell-test-server = pkgs.writeShellScriptBin "start-test-server" ''
     set -xe
