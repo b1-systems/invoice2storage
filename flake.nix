@@ -34,13 +34,89 @@
     WORKDIR="''${WORKDIR:-/tmp/invoice2storage}"
     cat $WORKDIR/.pids | xargs kill -9
   '';
+        minio-credentials = pkgs.writeText "/etc/minio-credentials" ''
+          MINIO_ROOT_USER=test
+          MINIO_ROOT_PASSWORD=testme
+        '';
+      in let
+        # main invoice2storage derivative
+        invoice2storage = naersk-lib.buildPackage {
+            src = ./.;
+            buildInputs =  with pkgs; [cargo rustc] ++ deps;
+            nativeBuildInputs = nativeDeps;
+        };
+      in let
+        testVM =  nixpkgs.lib.nixosSystem {
+            system = system;
+            modules = [
+              "${nixpkgs}/nixos/modules/profiles/qemu-guest.nix"
+              ({ pkgs, ... }: {
+
+                # boot.isContainer = true;
+                documentation.nixos.enable = false;
+                # Let 'nixos-version --json' know about the Git revision
+                # of this flake.
+                system.configurationRevision = nixpkgs.lib.mkIf (self ? rev) self.rev;
+
+                environment.systemPackages = [
+                  invoice2storage
+                ];
+                # Network configuration.
+                networking = {
+                  hostName = "i2s-test";
+                  useDHCP = true;
+                  firewall.enable = false;
+                };
+
+                services.dovecot2 = {
+                  enable = true;
+                };
+
+                services.postfix = {
+                  enable = true;
+                };
+
+                services.minio = {
+                  enable = true;
+                  dataDir = ["/home/test/files"];
+                  rootCredentialsFile = minio-credentials;
+                };
+
+                users.users.test = {
+                  password = "test";
+                  group = "test";
+                  extraGroups = [ "sudo" ];
+                  isNormalUser = true;
+                };
+                users.groups.test = {};
+                system.stateVersion = "22.11";
+
+                # print ip address on system start
+                systemd.services.showIp = {
+                  enable = true;
+                  script = "ip addr show";
+                  after = ["basic.target"];
+                  unitConfig = {
+                    StandardOutput = "journal+console";
+                  };
+                };
+                services.getty.autologinUser = "test";
+                # services.greetd = {
+                #   enable = true;
+                #   settings = {
+                #     default_session = {
+                #       command = "${pkgs.greetd.greetd}/bin/agreety --cmd 'ip a s; $SHELL'";
+                #     };
+                #   };
+                # };
+              })
+            ];
+            specialArgs = { inherit self; };
+
+          };
       in
       {
-        defaultPackage = naersk-lib.buildPackage {
-          src = ./.;
-          buildInputs =  with pkgs; [cargo rustc] + deps;
-          nativeBuildInputs = nativeDeps;
-        };
+        defaultPackage = invoice2storage;
 
         defaultApp = utils.lib.mkApp {
           drv = self.defaultPackage."${system}";
@@ -53,5 +129,8 @@
           LIBCLANG_PATH = "${pkgs.libclang.lib}/lib";
           RUSTC_PATH = "${sccache}/bin/sccache";
         };
+
+        packages.nixosConfigurations."testvm" = testVM;
+
       });
 }
