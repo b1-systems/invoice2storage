@@ -414,7 +414,14 @@ fn flags2maildir(flags: &Vec<String>) -> String {
             Flag::Draft => Some("D".to_owned()),
             Flag::Recent => None,
             Flag::MayCreate => None,
-            Flag::Custom(x) => Some(x.to_string()),
+            Flag::Custom(x) => {
+                if x.len() != 1 || !x.chars().all(|x| x.is_lowercase()) {
+                    log::warn!("Only one letter raw flags are currently supported in maildir. Ignoring flag");
+                    None
+                } else {
+                    Some(x.to_string())
+                }
+            },
         };
         if let Some(add) = add {
             rv.push_str(&add);
@@ -750,5 +757,17 @@ mod tests{
         assert_eq!(
             tt.render_str("{{ file_name | escape_filename}}", &context).unwrap(),
             "sH__itty__fIl name.xml".to_owned());
+    }
+
+    #[test]
+    fn test_flags() {
+        let flag_list = vec!["\\Flagged".to_owned(), "myflag".to_owned()];
+        assert_eq!(flags2imap(&flag_list),
+            vec![Flag::Flagged, Flag::Custom("myflag".into())]);
+
+        let flags2 = vec!["\\Flagged".to_owned(), "m".to_owned()];
+        assert_eq!(flags2maildir(&flags2),
+            "Fm".to_owned());
+
     }
 }
