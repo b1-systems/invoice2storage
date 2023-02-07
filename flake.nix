@@ -11,7 +11,7 @@
         pkgs = import nixpkgs { inherit system; };
         naersk-lib = pkgs.callPackage naersk { };
       in let
-        deps = with pkgs; [ openssl ];
+        deps = with pkgs; [ ];
         nativeDeps = with pkgs; [pkg-config sccache];
         testDeps = with pkgs; [dave minio mkcert dovecot];
 

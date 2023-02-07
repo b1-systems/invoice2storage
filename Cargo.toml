@@ -7,8 +7,9 @@ edition = "2021"
 
 [dependencies]
 anyhow = "1.0.68"
-async-imap = { version = "0.6.0", features = ["runtime-tokio"], default-features = false }
-async-native-tls = { version = "0.4.0", default-features = false, features = ["runtime-tokio"] }
+# async-imap = { version = "0.6.0", features = ["runtime-tokio"], default-features = false }
+#async-native-tls = { version = "0.4.0", default-features = false, features = ["runtime-tokio"] }
+imap = { version = "2.4.1", default-features = false }
 backoff = { version = "0.4.0"}
 base64 = "0.21.0"
 clap = { version = "4.0.29", features = ["cargo", "string", "derive", "env"] }
@@ -24,3 +25,4 @@ stderrlog = "0.5.4"
 tera = "1.17.1"
 tokio = "1.23.0"
 url = "2.3.1"
+rustls-connector = "0.16.1"

@@ -15,6 +15,7 @@ use backoff::backoff::Backoff;
 use clap::{arg, command, Parser};
 use maildir::Maildir;
 use mailparse::*;
+use rustls_connector::RustlsConnector;
 use tera::{Value, Tera};
 use tokio::sync::oneshot::error;
 use url::Url;
@@ -22,12 +23,15 @@ use std::collections::HashMap;
 use std::error::Error;
 use std::fmt::Display;
 use std::io::prelude::*;
+use std::ops::Add;
 use std::path::{PathBuf, Path};
 use std::process::ExitCode;
 use std::str::FromStr;
 use std::string::*;
 use std::{fs::File};
 use tokio;
+use std::{net::TcpStream};
+use imap::types::Flag;
 
 // lazy_static! {
 //     static ref DEFAULT_EXTRACT_MIME: MimeArguments = MimeArguments(vec![
@@ -40,8 +44,10 @@ const UNKNOWN_USER_DEFAULT: &'static str = "_UNKNOWN";
 const UNKNOWN_FROM_DEFAULT: &'static str = "UNKNOWN";
 const DEFAULT_PATH_TEMPLATE: &'static str = "{{user | lower}}/{{file_name | escape_filename}}";
 const DEFAULT_MAIL_TEMPLATE: &'static str = "{{user | lower}}.{% if errors %}new{% else %}done{% endif %}";
-const DEFAULT_MAIL_FLAGS: &'static str = "";
-const ERROR_MAIL_FLAGS: &'static str = "F";
+//const DEFAULT_MAIL_FLAGS: &'static str = "";
+//const ERROR_MAIL_FLAGS: &'static str = "F";
+//const DEFAULT_MAIL_FLAGS: &'static [Flag] = &[Flag::Seen];
+//const ERROR_MAIL_FLAGS: &'static [Flag] = &[Flag::Flagged];
 const FALLBACK_MAIL_TARGET: &'static str = "";
 const IMAP_INBOX_PREFIX: &'static str = "INBOX";
 
@@ -142,6 +148,16 @@ struct Args {
     /// Imap target folder
     #[arg(long, env, default_value_t = DEFAULT_MAIL_TEMPLATE.to_owned(), help = "Mail template folder")]
     mail_template: String,
+
+    /// Flags in success case
+    // default_value_t = {DEFAULT_MAIL_FLAGS.to_owned().map(|x| x.to_string()) }
+    #[arg(long, env, help = "Mail flags in success case")]
+    success_flags: Vec<String>,
+
+    #[arg(long, env, default_value = "\\Flag", help = "Mail flags in error cases")]
+    error_flags: Vec<String>,
+
+
 }
 
 /// Returns the given text that is safe to use as a filename.
@@ -383,8 +399,39 @@ fn create_object_store(args: &Args) -> Result<Box<dyn object_store::ObjectStore>
 //     }
 // }
 
+/// Transforms a list of imap flags to maildir flag
+fn flags2maildir(flags: &Vec<String>) -> String {
+    let mut rv = String::new();
+    let imap_flags = flags2imap(flags);
+    // FIXME: support for dovecot-keywords file
+    // https://doc.dovecot.org/admin_manual/mailbox_formats/maildir/
+    for flag in imap_flags {
+        let add = match flag {
+            Flag::Answered => Some("A".to_owned()),
+            Flag::Seen => Some("S".to_owned()),
+            Flag::Flagged => Some("F".to_owned()),
+            Flag::Deleted => Some("T".to_owned()),
+            Flag::Draft => Some("D".to_owned()),
+            Flag::Recent => None,
+            Flag::MayCreate => None,
+            Flag::Custom(x) => Some(x.to_string()),
+        };
+        if let Some(add) = add {
+            rv.push_str(&add);
+        }
+    };
+    rv
+}
+
+/// Transforms a list of imap flags to maildir flag
+fn flags2imap(flags: &Vec<String>) -> Vec<Flag> {
+    // FIXME: support for dovecot-keywords file
+    // https://doc.dovecot.org/admin_manual/mailbox_formats/maildir/
+    flags.iter().map(|x| Flag::from(x.as_ref())).collect()
+}
+
 /// Stores mail in a maildir target
-fn store_to_maildir(path: &Path, content: &str, target: &str, flags: &str) -> Result<()> {
+fn store_to_maildir(path: &Path, content: &str, target: &str, flags: &Vec<String>) -> Result<()> {
     // write message to maildir backend
     // let mut backend = BackendBuilder::build(&ac, &backend_config)?;
     log::debug!("Target maildir folder: {}", target);
@@ -406,7 +453,9 @@ fn store_to_maildir(path: &Path, content: &str, target: &str, flags: &str) -> Re
 
     let id = md.store_new(content.as_bytes())?;
     let res = md.move_new_to_cur(&id);
-    let _add_flags = md.add_flags(&id, flags);
+    let mdir_flags = flags2maildir(flags);
+    
+    let _add_flags = md.add_flags(&id, &mdir_flags);
     // if exists.map(|x| x == 0).unwrap_or(true)  {
     //     log::info!("Target folder does not exist, creating");
     //     let new_path = if target.len() > 0 {
@@ -439,17 +488,24 @@ fn store_to_maildir(path: &Path, content: &str, target: &str, flags: &str) -> Re
 }
 
 /// Stores mail in a maildir target
-async fn store_to_imap(server: &str, content: &str, target: &str, flags: &str) -> Result<()> {
+fn store_to_imap(server: &str, content: &str, target: &str, flags: &Vec<String>) -> Result<()> {
     let conn_info = Url::parse(server).context("Can't parse imap target URL")?;
 
     let domain = conn_info.domain().ok_or_else(|| anyhow!("IMAP server domain is empty"))?;
     let port = conn_info.port().unwrap_or(993);
 
     let mut imap_session = if conn_info.scheme().to_lowercase() == "imaps" {
-        let tls = async_native_tls::TlsConnector::new();
+        //let tls = async_native_tls::TlsConnector::new();
         // we pass in the domain twice to check that the server's TLS
         // certificate is valid for the domain we're connecting to.
-        let client = async_imap::connect((domain, port), domain, tls).await?;
+        //let client = async_imap::connect((domain, port), domain, tls).await?;
+        let stream = TcpStream::connect((domain, port))?;
+        let tls = RustlsConnector::default();
+        let tlsstream = tls.connect(&domain, stream)?;
+
+        // we pass in the domain twice to check that the server's TLS
+        // certificate is valid for the domain we're connecting to.
+        let client = imap::Client::new(tlsstream);
     
         // the client we have here is unauthenticated.
         // to do anything useful with the e-mails, we need to log in
@@ -460,7 +516,6 @@ async fn store_to_imap(server: &str, content: &str, target: &str, flags: &str) -
         let pass = conn_info.password().ok_or(anyhow!("IMAP password not set"))?;
         let imap_session = client
             .login(conn_info.username(), pass)
-            .await
             .map_err(|e| e.0)?;
         imap_session
     } else {
@@ -474,24 +529,26 @@ async fn store_to_imap(server: &str, content: &str, target: &str, flags: &str) -
     };
     
     // we want to fetch the first email in the INBOX mailbox
-    let select = imap_session.select(&mbox_name).await;
+    let select = imap_session.select(&mbox_name);
     if let Err(err) = &select {
         println!("Err {:?}", err);
         log::info!("Creating target folder:  {}", &mbox_name);
 
-        let create_result = imap_session.create(&mbox_name).await;
+        let create_result = imap_session.create(&mbox_name);
         if let Err(err) = create_result {
             log::error!("Can't create target folder: {} {}", &mbox_name, err);
             return Err(anyhow!("Can't create target folder: {}", err));
         }
-        let select = imap_session.select(&mbox_name).await;
+        let select = imap_session.select(&mbox_name);
     }
     if select.is_err() {
         log::error!("Creating select imap folder:  {}", &mbox_name);
         bail!("Creating select imap folder:  {}", &mbox_name)
     }
 
-    let append = imap_session.append(&mbox_name, content).await;
+    let imap_flags = flags2imap(flags);
+
+    let append = imap_session.append_with_flags(&mbox_name, content, &imap_flags);
     
     if let Err(err) = append {
         log::error!("Can't append to target folder: {} {}", &mbox_name, err);
@@ -502,14 +559,14 @@ async fn store_to_imap(server: &str, content: &str, target: &str, flags: &str) -
 }
 
 /// Checks Args for configured targets and stores mail there
-async fn store_message(args: &Args, content: &str, target: &str, flags: &str) -> Result<()> {
+async fn store_message(args: &Args, content: &str, target: &str, flags: &Vec<String>) -> Result<()> {
     if let Some(maildir) = &args.maildir_path {
         // wrap in async runner
         return store_to_maildir(maildir.as_path(), content, target, flags);
     }
     if let Some(imap_url) = &args.imap_url {
         // wrap in async runner
-        return store_to_imap(imap_url, content, target, flags).await;
+        return store_to_imap(imap_url, content, target, flags);
     }
     Ok(())
 }
@@ -602,13 +659,13 @@ async fn main() -> ExitCode {
             log::error!("Fallback folder '{}'", &FALLBACK_MAIL_TARGET);
             FALLBACK_MAIL_TARGET.to_owned()
         });
-    let flags = if has_errors { ERROR_MAIL_FLAGS } else { DEFAULT_MAIL_FLAGS };
+    let flags = if has_errors { &args.error_flags } else { &args.success_flags };
 
     // backoff::
     let mut retry_backoff = backoff::ExponentialBackoff::default();
     loop {
         log::debug!("Store message");
-        let store_result = store_message(&args, &content, &target_folder, flags).await;
+        let store_result = store_message(&args, &content, &target_folder, &flags).await;
         match store_result {
             Ok(_x) => {
                 break;
