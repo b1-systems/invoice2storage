@@ -7,23 +7,21 @@
 extern crate base64;
 extern crate mailparse;
 
-#[macro_use]
 extern crate log;
 
 use anyhow::{Result, anyhow, bail, Context};
 use backoff::backoff::Backoff;
 use clap::{arg, command, Parser};
+use clap_serde_derive::ClapSerde;
 use maildir::Maildir;
 use mailparse::*;
 use rustls_connector::RustlsConnector;
 use tera::{Value, Tera};
-use tokio::sync::oneshot::error;
+use serde::Deserialize;
 use url::Url;
 use std::collections::HashMap;
-use std::error::Error;
 use std::fmt::Display;
-use std::io::prelude::*;
-use std::ops::Add;
+use std::io::{prelude::*, BufReader};
 use std::path::{PathBuf, Path};
 use std::process::ExitCode;
 use std::str::FromStr;
@@ -32,6 +30,7 @@ use std::{fs::File};
 use tokio;
 use std::{net::TcpStream};
 use imap::types::Flag;
+use resolve_path::PathResolveExt;
 
 // lazy_static! {
 //     static ref DEFAULT_EXTRACT_MIME: MimeArguments = MimeArguments(vec![
@@ -39,11 +38,15 @@ use imap::types::Flag;
 //     ]);
 // }
 
+const DEFAULT_CONFIG_FILE: &'static str = "~/.config/invoice2storage/config.toml";
 const DEFAULT_EXTRACT_MIMES: [&'static str; 1] = ["application/pdf"];
 const UNKNOWN_USER_DEFAULT: &'static str = "_UNKNOWN";
 const UNKNOWN_FROM_DEFAULT: &'static str = "UNKNOWN";
 const DEFAULT_PATH_TEMPLATE: &'static str = "{{user | lower}}/{{file_name | escape_filename}}";
 const DEFAULT_MAIL_TEMPLATE: &'static str = "{{user | lower}}.{% if errors %}new{% else %}done{% endif %}";
+const DEFAULT_FILE_NAME: &'static str = "-";
+const DEFAULT_ERROR_FLAGS: &'static str = "\\Flag";
+const DEFAULT_SUCCESS_FLAGS: &'static str = "";
 //const DEFAULT_MAIL_FLAGS: &'static str = "";
 //const ERROR_MAIL_FLAGS: &'static str = "F";
 //const DEFAULT_MAIL_FLAGS: &'static [Flag] = &[Flag::Seen];
@@ -52,7 +55,7 @@ const FALLBACK_MAIL_TARGET: &'static str = "";
 const IMAP_INBOX_PREFIX: &'static str = "INBOX";
 
 /// Mimetype argument list
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[repr(transparent)]
 struct MimeArguments(Vec<String>);
 
@@ -93,20 +96,31 @@ impl Into<clap::builder::OsStr> for MimeArguments {
 /// like webdav, directory, s3, ...
 /// 
 /// All templates are in the tera template. https://tera.netlify.app/
-#[derive(Parser, Debug)]
+#[derive(Parser, Deserialize, ClapSerde)]
 #[command(author, version, about, long_about = None)]
 struct Args {
     /// user name for unknown user
-    #[arg(long, default_value_t = {UNKNOWN_USER_DEFAULT.to_string()})]
-    unknown_user: String,
+    #[arg(long, default_value = {DEFAULT_CONFIG_FILE.to_string()}, help = "Config file to load")]
+    config_file: std::path::PathBuf,
 
-    #[arg(long, default_value_t={MimeArguments::default()})]
+    /// Rest of arguments
+    #[command(flatten)]
+    pub config: <Config as ClapSerde>::Opt,
+}
+
+#[derive(ClapSerde)]
+struct Config {
+    /// user name for unknown user
+    #[arg(long, default_value = {UNKNOWN_USER_DEFAULT.to_string()})]
+    unknown_user: String,
+    
+    #[arg(long, default_value={MimeArguments::default()})]
     accepted_mimetypes: MimeArguments,
 
-    #[arg(default_value_t= {"-".into()}, help = "File to extract")]
+    #[arg(default_value= {DEFAULT_FILE_NAME.to_string()}, help = "File to extract")]
     file: String,
 
-    #[arg(long, short, action=clap::ArgAction::Count, default_value_t=1, help = "Increase verbosity")]
+    #[arg(long, short, action=clap::ArgAction::Count, default_value="1", help = "Increase verbosity")]
     verbose: u8,
 
     #[arg(long, short, action=clap::ArgAction::SetTrue, help = "Silence all output")]
@@ -134,7 +148,7 @@ struct Args {
     stdout: bool,
 
     /// Target path for generated file
-    #[arg(long, env, default_value_t = DEFAULT_PATH_TEMPLATE.to_owned(), help = "template for file output path")]
+    #[arg(long, env, default_value = {DEFAULT_PATH_TEMPLATE.to_owned()}, help = "template for file output path")]
     output_template: String,
 
     /// Maildir output
@@ -146,18 +160,16 @@ struct Args {
     imap_url: Option<String>,
 
     /// Imap target folder
-    #[arg(long, env, default_value_t = DEFAULT_MAIL_TEMPLATE.to_owned(), help = "Mail template folder")]
+    #[arg(long, env, default_value = DEFAULT_MAIL_TEMPLATE.to_owned(), help = "Mail template folder")]
     mail_template: String,
 
     /// Flags in success case
     // default_value_t = {DEFAULT_MAIL_FLAGS.to_owned().map(|x| x.to_string()) }
-    #[arg(long, env, help = "Mail flags in success case")]
+    #[arg(long, env, default_value = DEFAULT_SUCCESS_FLAGS.to_owned(), help = "Mail flags in success case")]
     success_flags: Vec<String>,
 
-    #[arg(long, env, default_value = "\\Flag", help = "Mail flags in error cases")]
+    #[arg(long, env, default_value = DEFAULT_ERROR_FLAGS, help = "Mail flags in error cases")]
     error_flags: Vec<String>,
-
-
 }
 
 /// Returns the given text that is safe to use as a filename.
@@ -194,7 +206,7 @@ fn create_template_engine() -> Tera {
 /// Returns a list of extracted file names and the number of export errors
 async fn extract_files(
     parsed: &ParsedMail<'_>,
-    args: &Args,
+    config: &Config,
     user: &Option<String>,
 ) -> Result<(Vec<String>, u32)> {
 
@@ -211,14 +223,18 @@ async fn extract_files(
     let mut tt = create_template_engine();
 
 
-    let output = create_object_store(args)?;
+    let output = create_object_store(config)?;
 
-
+    let accepted_mimetypes = &config.accepted_mimetypes;
+    let muser = match user {
+        Some(x) => x.clone(),
+        None => config.unknown_user.clone(),
+    };
 
     let mut retry_backoff = backoff::ExponentialBackoff::default();
     for subpart in parsed.subparts.iter() {
         //let mimes = args.accepted_mimetypes.0;
-        if args.accepted_mimetypes.0.contains(&subpart.ctype.mimetype) {
+        if accepted_mimetypes.0.contains(&subpart.ctype.mimetype) {
             let content = &subpart.get_content_disposition();
             if content.disposition == DispositionType::Attachment {
                 println!("{:?}", content.params);
@@ -237,13 +253,10 @@ async fn extract_files(
                 //     from: from_.clone(),
                 //     file_size: 0,
                 // };
-                let muser = match user {
-                    Some(x) => x,
-                    None => &args.unknown_user,
-                };
+                
 
                 let mut context = tera::Context::new();
-                context.insert("user", muser);
+                context.insert("user", &muser);
                 context.insert("file_name", &filename);
                 context.insert("from", &from_);
 
@@ -255,7 +268,7 @@ async fn extract_files(
                 //     &filename
                 // );
                 //let path = tt.render("output", &context)?;
-                let rendered = tt.render_str(&args.output_template, &context);
+                let rendered = tt.render_str(&config.output_template, &context);
                 let path = match rendered {
                     Ok(x) => x,
                     Err(e) => {
@@ -373,15 +386,16 @@ pub fn extract_user(message: &ParsedMail) -> Option<String> {
 }
 
 /// Creates the object_store to save objects to.
-fn create_object_store(args: &Args) -> Result<Box<dyn object_store::ObjectStore>> {
-    if let Some(local_path) = &args.local_path {
+fn create_object_store(config: &Config) -> Result<Box<dyn object_store::ObjectStore>> {
+    if let Some(local_path) = &config.local_path {
         return Ok(Box::new(
             object_store::local::LocalFileSystem::new_with_prefix(local_path)?,
         ));
-    } else if let Some(http_path) = &args.http_path {
+    } else if let Some(http_path) = &config.http_path {
+        let allow_insecure = config.insecure;
         let options = object_store::ClientOptions::new()
             .with_allow_http(true)
-            .with_allow_invalid_certificates(args.insecure);
+            .with_allow_invalid_certificates(allow_insecure);
         let store = object_store::http::HttpBuilder::new()
             .with_url(http_path)
             .with_client_options(options)
@@ -449,8 +463,8 @@ fn store_to_maildir(path: &Path, content: &str, target: &str, flags: &Vec<String
     // create folder if there is no match or error
     let new_path = if target.len() > 0 {
         let dirname = format!(".{}", target);
-        let pname = PathBuf::from_str(&dirname)?;
-        path.join(pname)
+        let path_name = PathBuf::from_str(&dirname)?;
+        path.join(path_name)
     } else {
         path.to_owned()
     };
@@ -460,9 +474,9 @@ fn store_to_maildir(path: &Path, content: &str, target: &str, flags: &Vec<String
 
     let id = md.store_new(content.as_bytes())?;
     let res = md.move_new_to_cur(&id);
-    let mdir_flags = flags2maildir(flags);
+    let maildir_flags = flags2maildir(flags);
     
-    let _add_flags = md.add_flags(&id, &mdir_flags);
+    let _add_flags = md.add_flags(&id, &maildir_flags);
     // if exists.map(|x| x == 0).unwrap_or(true)  {
     //     log::info!("Target folder does not exist, creating");
     //     let new_path = if target.len() > 0 {
@@ -508,17 +522,17 @@ fn store_to_imap(server: &str, content: &str, target: &str, flags: &Vec<String>)
         //let client = async_imap::connect((domain, port), domain, tls).await?;
         let stream = TcpStream::connect((domain, port))?;
         let tls = RustlsConnector::default();
-        let tlsstream = tls.connect(&domain, stream)?;
+        let tls_stream = tls.connect(&domain, stream)?;
 
         // we pass in the domain twice to check that the server's TLS
         // certificate is valid for the domain we're connecting to.
-        let client = imap::Client::new(tlsstream);
+        let client = imap::Client::new(tls_stream);
     
         // the client we have here is unauthenticated.
         // to do anything useful with the e-mails, we need to log in
         if conn_info.username().len() == 0 {
             log::error!("IMAP requires a login user and password");
-            return bail!("IMAP user & password required")
+            bail!("IMAP user & password required")
         }
         let pass = conn_info.password().ok_or(anyhow!("IMAP password not set"))?;
         let imap_session = client
@@ -529,36 +543,36 @@ fn store_to_imap(server: &str, content: &str, target: &str, flags: &Vec<String>)
         bail!("Only imaps is supported")
     };
 
-    let mbox_name = if target.len() == 0 {
+    let mailbox_name = if target.len() == 0 {
         IMAP_INBOX_PREFIX.to_string()
     } else {
         format!("{}.{}", IMAP_INBOX_PREFIX, target)
     };
     
     // we want to fetch the first email in the INBOX mailbox
-    let select = imap_session.select(&mbox_name);
+    let mut select = imap_session.select(&mailbox_name);
     if let Err(err) = &select {
         println!("Err {:?}", err);
-        log::info!("Creating target folder:  {}", &mbox_name);
+        log::info!("Creating target folder:  {}", &mailbox_name);
 
-        let create_result = imap_session.create(&mbox_name);
+        let create_result = imap_session.create(&mailbox_name);
         if let Err(err) = create_result {
-            log::error!("Can't create target folder: {} {}", &mbox_name, err);
+            log::error!("Can't create target folder: {} {}", &mailbox_name, err);
             return Err(anyhow!("Can't create target folder: {}", err));
         }
-        let select = imap_session.select(&mbox_name);
+        select = imap_session.select(&mailbox_name);
     }
     if select.is_err() {
-        log::error!("Creating select imap folder:  {}", &mbox_name);
-        bail!("Creating select imap folder:  {}", &mbox_name)
+        log::error!("Creating select imap folder:  {}", &mailbox_name);
+        bail!("Creating select imap folder:  {}", &mailbox_name)
     }
 
     let imap_flags = flags2imap(flags);
 
-    let append = imap_session.append_with_flags(&mbox_name, content, &imap_flags);
+    let append = imap_session.append_with_flags(&mailbox_name, content, &imap_flags);
     
     if let Err(err) = append {
-        log::error!("Can't append to target folder: {} {}", &mbox_name, err);
+        log::error!("Can't append to target folder: {} {}", &mailbox_name, err);
         bail!("Can't append to target folder: {}", err);
     }
 
@@ -566,12 +580,12 @@ fn store_to_imap(server: &str, content: &str, target: &str, flags: &Vec<String>)
 }
 
 /// Checks Args for configured targets and stores mail there
-async fn store_message(args: &Args, content: &str, target: &str, flags: &Vec<String>) -> Result<()> {
-    if let Some(maildir) = &args.maildir_path {
+async fn store_message(config: &Config, content: &str, target: &str, flags: &Vec<String>) -> Result<()> {
+    if let Some(maildir) = &config.maildir_path {
         // wrap in async runner
         return store_to_maildir(maildir.as_path(), content, target, flags);
     }
-    if let Some(imap_url) = &args.imap_url {
+    if let Some(imap_url) = &config.imap_url {
         // wrap in async runner
         return store_to_imap(imap_url, content, target, flags);
     }
@@ -580,13 +594,35 @@ async fn store_message(args: &Args, content: &str, target: &str, flags: &Vec<Str
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> ExitCode {
-    let args = Args::parse();
+    let mut args = Args::parse();
+    // Get config file
+    let config_path = args.config_file.resolve();
+    let config = if let Ok(f) = File::open(&config_path) {
+        // Parse config with serde
+        let mut reader = BufReader::new(f);
+        let mut contents = String::new();
+        let res = reader.read_to_string(&mut contents);
+        if let Err(err) = res {
+            log::error!("Error reading config file: {}", &err);
+            return ExitCode::from(2);
+        }
+
+        match toml::from_str::<<Config as ClapSerde>::Opt>(&contents) {
+            // merge config already parsed from clap
+            Ok(config) => Config::from(config).merge(&mut args.config),
+            Err(err) => panic!("Error in configuration file:\n{}", err),
+        }
+    } else {
+        // If there is not config file return only config parsed from clap
+        Config::from(&mut args.config)
+    };
+
 
     // configure logging
     stderrlog::new()
         .module(module_path!())
-        .quiet(args.quiet)
-        .verbosity(args.verbose as usize)
+        .quiet(config.quiet)
+        .verbosity(config.verbose as usize)
         .timestamp(stderrlog::Timestamp::Second)
         .init()
         .unwrap();
@@ -594,14 +630,15 @@ async fn main() -> ExitCode {
 
     let mut content: String = String::new();
 
-    let file_name = &args.file;
+    let file_name = &config.file;
+
     if file_name == "-" {
         let res = std::io::stdin().lock().read_to_string(&mut content);
         if res.is_err() {
             log::error!("Can't read stdin: {}", res.err().unwrap());
         }
     } else {
-        let mut file = File::open(&file_name).unwrap();
+        let mut file = File::open(file_name).unwrap();
         let res = file.read_to_string(&mut content);
         if res.is_err() {
             log::error!("Can't read stdin: {}", res.err().unwrap());
@@ -609,7 +646,7 @@ async fn main() -> ExitCode {
     }
     let parsed = parse_mail(content.as_bytes());
 
-    let mut user: String = args.unknown_user.to_owned();
+    let mut user: String = config.unknown_user.clone();
     let mut user_found = false;
     let mut has_errors = false;
     let mut path_name_context = tera::Context::new();
@@ -617,7 +654,7 @@ async fn main() -> ExitCode {
     match parsed {
         Ok(message) => {
 
-            if let Some(overwrite_user) = &args.overwrite_user {
+            if let Some(overwrite_user) = &config.overwrite_user {
                 user.clone_from(overwrite_user);
                 user_found = true;
             } else if let Some(extracted_user) = extract_user(&message) {
@@ -629,7 +666,7 @@ async fn main() -> ExitCode {
             } else {
                 None
             };
-            let res = extract_files(&message, &args, &user_option).await;
+            let res = extract_files(&message, &config, &user_option).await;
 
 
             match &res {
@@ -660,19 +697,24 @@ async fn main() -> ExitCode {
     let _ = path_name_context.insert("user", &user);
     // calculate the output folder name
     let mut template = create_template_engine();
-    let target_folder = template.render_str(&args.mail_template, &path_name_context)
+    let mail_template = &config.mail_template;
+    let target_folder = template.render_str(&mail_template, &path_name_context)
         .unwrap_or_else(|err| {
-            log::error!("Can´t render output folder path: {}. Template was: '{}'", &err, &args.mail_template);
+            log::error!("Can´t render output folder path: {}. Template was: '{}'", &err, &mail_template);
             log::error!("Fallback folder '{}'", &FALLBACK_MAIL_TARGET);
             FALLBACK_MAIL_TARGET.to_owned()
         });
-    let flags = if has_errors { &args.error_flags } else { &args.success_flags };
+    let flags = if has_errors {
+            &config.error_flags
+        } else {
+            &config.success_flags
+        };
 
     // backoff::
     let mut retry_backoff = backoff::ExponentialBackoff::default();
     loop {
         log::debug!("Store message");
-        let store_result = store_message(&args, &content, &target_folder, &flags).await;
+        let store_result = store_message(&config, &content, &target_folder, &flags).await;
         match store_result {
             Ok(_x) => {
                 break;
@@ -695,7 +737,7 @@ async fn main() -> ExitCode {
     }
 
     // pip message if requested
-    if args.stdout {
+    if config.stdout {
         let stdout = std::io::stdout();
         let mut handle = stdout.lock();
     
