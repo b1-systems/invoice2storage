@@ -9,28 +9,28 @@ extern crate mailparse;
 
 extern crate log;
 
-use anyhow::{Result, anyhow, bail, Context};
+use anyhow::{anyhow, bail, Context, Result};
 use backoff::backoff::Backoff;
 use clap::{arg, command, Parser};
 use clap_serde_derive::ClapSerde;
+use imap::types::Flag;
 use maildir::Maildir;
 use mailparse::*;
+use resolve_path::PathResolveExt;
 use rustls_connector::RustlsConnector;
-use tera::{Value, Tera};
 use serde::Deserialize;
-use url::Url;
 use std::collections::HashMap;
 use std::fmt::Display;
+use std::fs::File;
 use std::io::{prelude::*, BufReader};
-use std::path::{PathBuf, Path};
+use std::net::TcpStream;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::str::FromStr;
 use std::string::*;
-use std::{fs::File};
+use tera::{Tera, Value};
 use tokio;
-use std::{net::TcpStream};
-use imap::types::Flag;
-use resolve_path::PathResolveExt;
+use url::Url;
 
 // lazy_static! {
 //     static ref DEFAULT_EXTRACT_MIME: MimeArguments = MimeArguments(vec![
@@ -43,7 +43,8 @@ const DEFAULT_EXTRACT_MIMES: [&'static str; 1] = ["application/pdf"];
 const UNKNOWN_USER_DEFAULT: &'static str = "_UNKNOWN";
 const UNKNOWN_FROM_DEFAULT: &'static str = "UNKNOWN";
 const DEFAULT_PATH_TEMPLATE: &'static str = "{{user | lower}}/{{file_name | escape_filename}}";
-const DEFAULT_MAIL_TEMPLATE: &'static str = "{{user | lower}}.{% if errors %}new{% else %}done{% endif %}";
+const DEFAULT_MAIL_TEMPLATE: &'static str =
+    "{{user | lower}}.{% if errors %}new{% else %}done{% endif %}";
 const DEFAULT_FILE_NAME: &'static str = "-";
 const DEFAULT_ERROR_FLAGS: &'static str = "\\Flag";
 const DEFAULT_SUCCESS_FLAGS: &'static str = "";
@@ -73,7 +74,10 @@ impl From<Vec<String>> for MimeArguments {
 
 impl Default for MimeArguments {
     fn default() -> Self {
-        let inner: Vec<String> = DEFAULT_EXTRACT_MIMES.iter().map(|x| x.to_string()).collect();
+        let inner: Vec<String> = DEFAULT_EXTRACT_MIMES
+            .iter()
+            .map(|x| x.to_string())
+            .collect();
         Self(inner)
     }
 }
@@ -94,7 +98,7 @@ impl Into<clap::builder::OsStr> for MimeArguments {
 
 /// A email processor to extract email attachments and store them on a storage backend.
 /// like webdav, directory, s3, ...
-/// 
+///
 /// All templates are in the tera template. https://tera.netlify.app/
 #[derive(Parser, Deserialize, ClapSerde)]
 #[command(author, version, about, long_about = None)]
@@ -113,7 +117,7 @@ struct Config {
     /// user name for unknown user
     #[arg(long, default_value = {UNKNOWN_USER_DEFAULT.to_string()})]
     unknown_user: String,
-    
+
     #[arg(long, default_value={MimeArguments::default()})]
     accepted_mimetypes: MimeArguments,
 
@@ -128,11 +132,11 @@ struct Config {
 
     // Output options
     /// Local path to save extensions to
-    #[arg(long, env="LOCAL_PATH")]
+    #[arg(long, env = "LOCAL_PATH")]
     local_path: Option<PathBuf>,
 
     /// Store extensions at webdav target
-    #[arg(long, env="HTTP_PATH")]
+    #[arg(long, env = "HTTP_PATH")]
     http_path: Option<String>,
 
     /// Store extensions at webdav target
@@ -152,11 +156,19 @@ struct Config {
     output_template: String,
 
     /// Maildir output
-    #[arg(long, env="MAILDIR_PATH", help = "Maildir folder to save messages to, instead of imap")]
+    #[arg(
+        long,
+        env = "MAILDIR_PATH",
+        help = "Maildir folder to save messages to, instead of imap"
+    )]
     maildir_path: Option<PathBuf>,
 
     /// Store extensions at webdav target
-    #[arg(long, env="IMAP_URL", help = "IMAP connection url. imaps://user:password@host")]
+    #[arg(
+        long,
+        env = "IMAP_URL",
+        help = "IMAP connection url. imaps://user:password@host"
+    )]
     imap_url: Option<String>,
 
     /// Imap target folder
@@ -180,7 +192,7 @@ pub fn escape_filename(value: &Value, _: &HashMap<String, Value>) -> tera::Resul
     let mut output = String::with_capacity(s.len() * 2);
     for c in s.chars() {
         match c {
-            token if token.is_control()  => output.push_str("_"),
+            token if token.is_control() => output.push_str("_"),
             '<' => output.push_str("_"),
             '>' => output.push_str("_"),
             ':' => output.push_str("_"),
@@ -209,19 +221,19 @@ async fn extract_files(
     config: &Config,
     user: &Option<String>,
 ) -> Result<(Vec<String>, u32)> {
-
-
     let mut files = Vec::new();
     let mut errors = 0;
 
     let mut unknown = 0;
-    let from_ = parsed.headers.get_first_value("from").unwrap_or(UNKNOWN_FROM_DEFAULT.to_owned());
+    let from_ = parsed
+        .headers
+        .get_first_value("from")
+        .unwrap_or(UNKNOWN_FROM_DEFAULT.to_owned());
 
     // output template context
     //let mut tt = TinyTemplate::new();
     //tt.add_template("output", &args.output_template)?;
     let mut tt = create_template_engine();
-
 
     let output = create_object_store(config)?;
 
@@ -253,13 +265,11 @@ async fn extract_files(
                 //     from: from_.clone(),
                 //     file_size: 0,
                 // };
-                
 
                 let mut context = tera::Context::new();
                 context.insert("user", &muser);
                 context.insert("file_name", &filename);
                 context.insert("from", &from_);
-
 
                 // let path = format!(
                 //     "{}/{}",
@@ -283,13 +293,15 @@ async fn extract_files(
                 let body = subpart.get_body_raw();
                 if let Ok(body_vec) = body {
                     loop {
-                        let success = output.put(&path.clone().into(), body_vec.clone().into()).await;
+                        let success = output
+                            .put(&path.clone().into(), body_vec.clone().into())
+                            .await;
                         match success {
                             Ok(_) => {
                                 files.push(path);
                                 retry_backoff.reset();
                                 break;
-                            },
+                            }
                             Err(e) => {
                                 errors += 1;
                                 let wait = retry_backoff.next_backoff();
@@ -298,7 +310,7 @@ async fn extract_files(
                                     Some(wait) => {
                                         log::info!("Retry in: {} seconds", wait.as_secs());
                                         tokio::time::sleep(wait).await
-                                    },
+                                    }
                                     None => {
                                         log::error!("Maximum number of retries reached.");
                                         errors += 1;
@@ -351,15 +363,11 @@ pub fn extract_user(message: &ParsedMail) -> Option<String> {
                 if from_list.len() > 0 && to_list.len() > 0 {
                     // extract domain names
                     let from_domain = match &from_list[0] {
-                        MailAddr::Single(info) => {
-                            info.addr.rsplit('@').nth(0)
-                        }
+                        MailAddr::Single(info) => info.addr.rsplit('@').nth(0),
                         _ => None,
                     };
                     let to_domain = match &to_list[0] {
-                        MailAddr::Single(info) => {
-                            info.addr.rsplit('@').nth(0)
-                        }
+                        MailAddr::Single(info) => info.addr.rsplit('@').nth(0),
                         _ => None,
                     };
                     // in case both domains match, extract from username
@@ -367,9 +375,11 @@ pub fn extract_user(message: &ParsedMail) -> Option<String> {
                         // extract the user from
                         if to_domain == from_domain {
                             if let Some(user) = match &from_list[0] {
-                                MailAddr::Single(info) => {
-                                    info.addr.split('@').nth(0).and_then(|addr| addr.split("+").nth(0))
-                                }
+                                MailAddr::Single(info) => info
+                                    .addr
+                                    .split('@')
+                                    .nth(0)
+                                    .and_then(|addr| addr.split("+").nth(0)),
                                 _ => None,
                             } {
                                 return Some(user.to_string());
@@ -435,12 +445,12 @@ fn flags2maildir(flags: &Vec<String>) -> String {
                 } else {
                     Some(x.to_string())
                 }
-            },
+            }
         };
         if let Some(add) = add {
             rv.push_str(&add);
         }
-    };
+    }
     rv
 }
 
@@ -459,7 +469,7 @@ fn store_to_maildir(path: &Path, content: &str, target: &str, flags: &Vec<String
     // let exists = backend.folder_list()
     //     .map(|x| x.0.into_iter()
     //         .filter(|f| {println!("{}", &f.name); f.name == target}).count());
-    
+
     // create folder if there is no match or error
     let new_path = if target.len() > 0 {
         let dirname = format!(".{}", target);
@@ -475,7 +485,7 @@ fn store_to_maildir(path: &Path, content: &str, target: &str, flags: &Vec<String
     let id = md.store_new(content.as_bytes())?;
     let res = md.move_new_to_cur(&id);
     let maildir_flags = flags2maildir(flags);
-    
+
     let _add_flags = md.add_flags(&id, &maildir_flags);
     // if exists.map(|x| x == 0).unwrap_or(true)  {
     //     log::info!("Target folder does not exist, creating");
@@ -500,7 +510,7 @@ fn store_to_maildir(path: &Path, content: &str, target: &str, flags: &Vec<String
         Ok(_) => {
             log::info!("Maildir message was stored: {}", &id);
             Ok(())
-        },
+        }
         Err(e) => {
             log::info!("Error storing to Maildir: {}", e);
             anyhow::bail!(e);
@@ -512,7 +522,9 @@ fn store_to_maildir(path: &Path, content: &str, target: &str, flags: &Vec<String
 fn store_to_imap(server: &str, content: &str, target: &str, flags: &Vec<String>) -> Result<()> {
     let conn_info = Url::parse(server).context("Can't parse imap target URL")?;
 
-    let domain = conn_info.domain().ok_or_else(|| anyhow!("IMAP server domain is empty"))?;
+    let domain = conn_info
+        .domain()
+        .ok_or_else(|| anyhow!("IMAP server domain is empty"))?;
     let port = conn_info.port().unwrap_or(993);
 
     let mut imap_session = if conn_info.scheme().to_lowercase() == "imaps" {
@@ -527,17 +539,17 @@ fn store_to_imap(server: &str, content: &str, target: &str, flags: &Vec<String>)
         // we pass in the domain twice to check that the server's TLS
         // certificate is valid for the domain we're connecting to.
         let client = imap::Client::new(tls_stream);
-    
+
         // the client we have here is unauthenticated.
         // to do anything useful with the e-mails, we need to log in
         if conn_info.username().len() == 0 {
             log::error!("IMAP requires a login user and password");
             bail!("IMAP user & password required")
         }
-        let pass = conn_info.password().ok_or(anyhow!("IMAP password not set"))?;
-        let imap_session = client
-            .login(conn_info.username(), pass)
-            .map_err(|e| e.0)?;
+        let pass = conn_info
+            .password()
+            .ok_or(anyhow!("IMAP password not set"))?;
+        let imap_session = client.login(conn_info.username(), pass).map_err(|e| e.0)?;
         imap_session
     } else {
         bail!("Only imaps is supported")
@@ -548,7 +560,7 @@ fn store_to_imap(server: &str, content: &str, target: &str, flags: &Vec<String>)
     } else {
         format!("{}.{}", IMAP_INBOX_PREFIX, target)
     };
-    
+
     // we want to fetch the first email in the INBOX mailbox
     let mut select = imap_session.select(&mailbox_name);
     if let Err(err) = &select {
@@ -570,7 +582,7 @@ fn store_to_imap(server: &str, content: &str, target: &str, flags: &Vec<String>)
     let imap_flags = flags2imap(flags);
 
     let append = imap_session.append_with_flags(&mailbox_name, content, &imap_flags);
-    
+
     if let Err(err) = append {
         log::error!("Can't append to target folder: {} {}", &mailbox_name, err);
         bail!("Can't append to target folder: {}", err);
@@ -580,7 +592,12 @@ fn store_to_imap(server: &str, content: &str, target: &str, flags: &Vec<String>)
 }
 
 /// Checks Args for configured targets and stores mail there
-async fn store_message(config: &Config, content: &str, target: &str, flags: &Vec<String>) -> Result<()> {
+async fn store_message(
+    config: &Config,
+    content: &str,
+    target: &str,
+    flags: &Vec<String>,
+) -> Result<()> {
     if let Some(maildir) = &config.maildir_path {
         // wrap in async runner
         return store_to_maildir(maildir.as_path(), content, target, flags);
@@ -617,7 +634,6 @@ async fn main() -> ExitCode {
         Config::from(&mut args.config)
     };
 
-
     // configure logging
     stderrlog::new()
         .module(module_path!())
@@ -626,7 +642,6 @@ async fn main() -> ExitCode {
         .timestamp(stderrlog::Timestamp::Second)
         .init()
         .unwrap();
-
 
     let mut content: String = String::new();
 
@@ -653,7 +668,6 @@ async fn main() -> ExitCode {
 
     match parsed {
         Ok(message) => {
-
             if let Some(overwrite_user) = &config.overwrite_user {
                 user.clone_from(overwrite_user);
                 user_found = true;
@@ -661,23 +675,14 @@ async fn main() -> ExitCode {
                 user = extracted_user;
                 user_found = true;
             };
-            let user_option = if user_found {
-                Some(user.clone())
-            } else {
-                None
-            };
+            let user_option = if user_found { Some(user.clone()) } else { None };
             let res = extract_files(&message, &config, &user_option).await;
-
 
             match &res {
                 Ok((files, errors)) => {
                     path_name_context.insert("errors", errors);
                     path_name_context.insert("files", files);
-                    log::info!(
-                        "Found {} files for user {}",
-                        files.len(),
-                        &user
-                    );
+                    log::info!("Found {} files for user {}", files.len(), &user);
                     if errors > &0 {
                         has_errors = true;
                     }
@@ -687,7 +692,7 @@ async fn main() -> ExitCode {
                     has_errors = true;
                 }
             };
-        },
+        }
         Err(e) => {
             log::error!("Error, can't parse mime email: {}", e);
             has_errors = true;
@@ -698,17 +703,22 @@ async fn main() -> ExitCode {
     // calculate the output folder name
     let mut template = create_template_engine();
     let mail_template = &config.mail_template;
-    let target_folder = template.render_str(&mail_template, &path_name_context)
+    let target_folder = template
+        .render_str(&mail_template, &path_name_context)
         .unwrap_or_else(|err| {
-            log::error!("Can´t render output folder path: {}. Template was: '{}'", &err, &mail_template);
+            log::error!(
+                "Can´t render output folder path: {}. Template was: '{}'",
+                &err,
+                &mail_template
+            );
             log::error!("Fallback folder '{}'", &FALLBACK_MAIL_TARGET);
             FALLBACK_MAIL_TARGET.to_owned()
         });
     let flags = if has_errors {
-            &config.error_flags
-        } else {
-            &config.success_flags
-        };
+        &config.error_flags
+    } else {
+        &config.success_flags
+    };
 
     // backoff::
     let mut retry_backoff = backoff::ExponentialBackoff::default();
@@ -718,7 +728,7 @@ async fn main() -> ExitCode {
         match store_result {
             Ok(_x) => {
                 break;
-            },
+            }
             Err(e) => {
                 let wait = retry_backoff.next_backoff();
                 log::warn!("Error storing mail: {}", e);
@@ -726,7 +736,7 @@ async fn main() -> ExitCode {
                     Some(wait) => {
                         log::info!("Retry in: {} seconds", wait.as_secs());
                         tokio::time::sleep(wait).await
-                    },
+                    }
                     None => {
                         log::error!("Maximum number of retries reached.");
                         break;
@@ -740,7 +750,7 @@ async fn main() -> ExitCode {
     if config.stdout {
         let stdout = std::io::stdout();
         let mut handle = stdout.lock();
-    
+
         let res = handle.write_all(content.as_bytes());
         if res.is_err() {
             log::error!("Can't write to stdout: {}", res.err().unwrap());
@@ -750,66 +760,72 @@ async fn main() -> ExitCode {
     ExitCode::SUCCESS
 }
 
-
-
 #[cfg(test)]
-mod tests{
+mod tests {
     use super::*;
 
     #[test]
     fn test_user_extraction() {
         macro_rules! test_user {
             ($m:expr, None) => {
-                    let msg1 = parse_mail($m.as_ref()).unwrap();
-                    assert_eq!(extract_user(&msg1),
-                    None);
+                let msg1 = parse_mail($m.as_ref()).unwrap();
+                assert_eq!(extract_user(&msg1), None);
             };
             ($m:expr, $exp:expr) => {
-                        let msg1 = parse_mail($m.as_ref()).unwrap();
-                        assert_eq!(extract_user(&msg1),
-                            Some($exp.to_string()));
-                        };
+                let msg1 = parse_mail($m.as_ref()).unwrap();
+                assert_eq!(extract_user(&msg1), Some($exp.to_string()));
+            };
         }
-        test_user!(r#"
+        test_user!(
+            r#"
             From: test@example.com
             To: office@example.com
             "#,
-            "test");
-        test_user!(r#"
+            "test"
+        );
+        test_user!(
+            r#"
             From: test@test.com
             To: office@example.com
             "#,
-            None);
-        test_user!(r#"
+            None
+        );
+        test_user!(
+            r#"
             From: test+user1@test.com
             To: office@example.com
             "#,
-            "user1");
-        test_user!(r#"
+            "user1"
+        );
+        test_user!(
+            r#"
             From: foo+user1@example.com
             To: office@example.com
             "#,
-            "foo");
+            "foo"
+        );
     }
     #[test]
     fn test_escape_fn() {
         let mut tt = create_template_engine();
         let mut context = tera::Context::new();
-        context.insert("file_name",  "sH\\itty/fIl name.xml");
+        context.insert("file_name", "sH\\itty/fIl name.xml");
         assert_eq!(
-            tt.render_str("{{ file_name | escape_filename}}", &context).unwrap(),
-            "sH__itty__fIl name.xml".to_owned());
+            tt.render_str("{{ file_name | escape_filename}}", &context)
+                .unwrap(),
+            "sH__itty__fIl name.xml".to_owned()
+        );
     }
 
     #[test]
     fn test_flags() {
         let flag_list = vec!["\\Flagged".to_owned(), "myflag".to_owned()];
-        assert_eq!(flags2imap(&flag_list),
-            vec![Flag::Flagged, Flag::Custom("myflag".into())]);
+        assert_eq!(
+            flags2imap(&flag_list),
+            vec![Flag::Flagged, Flag::Custom("myflag".into())]
+        );
 
         let flags2 = vec!["\\Flagged".to_owned(), "m".to_owned()];
-        assert_eq!(flags2maildir(&flags2),
-            "Fm".to_owned());
-
+        assert_eq!(flags2maildir(&flags2), "Fm".to_owned());
     }
 }
