@@ -34,6 +34,13 @@
     WORKDIR="''${WORKDIR:-/tmp/invoice2storage}"
     cat $WORKDIR/.pids | xargs kill -9
   '';
+        shell-start-testvm = pkgs.writeShellScriptBin "start-test-vm" ''
+         set -e
+         export SHARED_DIR=`pwd`
+         echo "build test-vm"
+         nixos-rebuild build-vm --flake .#testvm
+         ./result/bin/run-i2s-test-vm
+        '';
         minio-credentials = pkgs.writeText "/etc/minio-credentials" ''
           MINIO_ROOT_USER=test
           MINIO_ROOT_PASSWORD=testme
@@ -124,7 +131,7 @@
 
         devShell = with pkgs; mkShell {
           buildInputs = deps;
-          nativeBuildInputs = [ pre-commit rustup nixfmt cargo-watch shell-test-server shell-test-server-stop ] ++ nativeDeps ++ testDeps;
+          nativeBuildInputs = [ pre-commit rustup nixfmt cargo-watch shell-test-server shell-test-server-stop shell-start-testvm] ++ nativeDeps ++ testDeps;
           RUST_SRC_PATH = rustPlatform.rustLibSrc;
           LIBCLANG_PATH = "${pkgs.libclang.lib}/lib";
           RUSTC_PATH = "${sccache}/bin/sccache";
