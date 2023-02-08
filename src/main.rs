@@ -113,7 +113,7 @@ struct Args {
 }
 
 #[derive(ClapSerde)]
-struct Config {
+pub struct Config {
     /// user name for unknown user
     #[arg(long, default_value = {UNKNOWN_USER_DEFAULT.to_string()})]
     unknown_user: String,
@@ -359,7 +359,7 @@ pub fn extract_user(message: &ParsedMail) -> Option<String> {
         if let Some(from_) = message.headers.get_first_value("from") {
             let parsed_from = mailparse::addrparse(&from_);
             let parsed_to = mailparse::addrparse(&to);
-            if let (Ok(from_list), Ok(to_list)) = (parsed_to, parsed_from) {
+            if let (Ok(from_list), Ok(to_list)) = (parsed_from, parsed_to) {
                 if from_list.len() > 0 && to_list.len() > 0 {
                     // extract domain names
                     let from_domain = match &from_list[0] {
@@ -372,7 +372,7 @@ pub fn extract_user(message: &ParsedMail) -> Option<String> {
                     };
                     // in case both domains match, extract from username
                     if let (Some(to_domain), Some(from_domain)) = (to_domain, from_domain) {
-                        // extract the user from
+                        // extract the user from the from part
                         if to_domain == from_domain {
                             if let Some(user) = match &from_list[0] {
                                 MailAddr::Single(info) => info
@@ -777,31 +777,30 @@ mod tests {
             };
         }
         test_user!(
-            r#"
-            From: test@example.com
-            To: office@example.com
-            "#,
+            "From: test@example.com\n\
+            To: office@example.com\n\
+            ",
             "test"
         );
         test_user!(
-            r#"
-            From: test@test.com
-            To: office@example.com
-            "#,
+            "\
+            From: test@test.com\n\
+            To: office@example.com\n\n\
+            ",
             None
         );
         test_user!(
-            r#"
-            From: test+user1@test.com
-            To: office@example.com
-            "#,
+            "\
+            From: test1@test.com\n\
+            To: office+user1@example.com\n\n\
+            ",
             "user1"
         );
         test_user!(
-            r#"
-            From: foo+user1@example.com
-            To: office@example.com
-            "#,
+            "\
+            From: foo+user1@example.com\n\
+            To: office@example.com\n\n\
+            ",
             "foo"
         );
     }

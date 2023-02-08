@@ -12,5 +12,5 @@ repos:
     rev: master
     hooks:
     -   id: fmt
-        args: ['--verbose', '--edition', '2021', '--']
+        args: ['--verbose', '--']
     -   id: cargo-check
