@@ -53,7 +53,8 @@
             nativeBuildInputs = nativeDeps;
         };
       in let
-        testVM =  nixpkgs.lib.nixosSystem {
+        # function creates a nixosSystem with extra_packages installed
+        testVM = extra_packages: nixpkgs.lib.nixosSystem {
             system = system;
             modules = [
               "${nixpkgs}/nixos/modules/profiles/qemu-guest.nix"
@@ -66,8 +67,9 @@
                 system.configurationRevision = nixpkgs.lib.mkIf (self ? rev) self.rev;
 
                 environment.systemPackages = [
-                  invoice2storage
-                ];
+                  pkgs.cargo
+                  pkgs.rustc
+                ] ++ extra_packages;
                 # Network configuration.
                 networking = {
                   hostName = "i2s-test";
@@ -137,7 +139,8 @@
           RUSTC_PATH = "${sccache}/bin/sccache";
         };
 
-        packages.nixosConfigurations."testvm" = testVM;
+        packages.nixosConfigurations."testvm" = (testVM [invoice2storage]);
+        packages.nixosConfigurations."buildvm" = (testVM []);
 
       });
 }
