@@ -25,11 +25,12 @@ stderrlog = "0.5.4"
 tera = "1.17.1"
 tokio = "1.23.0"
 url = "2.3.1"
-rustls-connector = "0.16.1"
 toml = "0.7.1"
 serde = { version = "1.0.152", features = ["derive"] }
 clap-serde-derive = "0.2.0"
 resolve-path = "0.1.0"
+rustls = { version = "0.20.8", features = ["dangerous_configuration"] }
+rustls-native-certs = "0.6.2"
 
 [dev-dependencies]
 reqwest = { version = "0.11.14", features = ["rustls-tls", "blocking"], default-features = false }

@@ -1,6 +1,6 @@
 // copyright: B1 Systems GmbH <info@b1-systems.de>, 2022
 // license: GPLv3+, http://www.gnu.org/licenses/gpl-3.0.html
-// author: Daniel Poelzleithner <poelzleithner@b1-systems.de>, 2022
+// author: Daniel Poelzleithner <poelzleithner@b1-systems.de>, 2022-2023
 
 /// Parses the email from file or stdin. Extracts all pdf attachments
 /// and uploads the file to a cloud storage or local path
@@ -17,7 +17,6 @@ use imap::types::Flag;
 use maildir::Maildir;
 use mailparse::*;
 use resolve_path::PathResolveExt;
-use rustls_connector::RustlsConnector;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::fmt::Display;
@@ -96,6 +95,48 @@ impl Into<clap::builder::OsStr> for MimeArguments {
     }
 }
 
+/// Verifier does not verify anything. Used with --insecure mode
+struct NoCertificateVerification {}
+impl rustls::client::ServerCertVerifier for NoCertificateVerification {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &rustls::Certificate,
+        _intermediates: &[rustls::Certificate],
+        _server_name: &rustls::ServerName,
+        _scts: &mut dyn Iterator<Item = &[u8]>,
+        _ocsp_response: &[u8],
+        _now: std::time::SystemTime,
+    ) -> std::result::Result<rustls::client::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &rustls::Certificate,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> std::result::Result<rustls::client::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &rustls::Certificate,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> std::result::Result<rustls::client::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        rustls::client::WebPkiVerifier::verification_schemes()
+    }
+
+    fn request_scts(&self) -> bool {
+        true
+    }
+}
+
 /// A email processor to extract email attachments and store them on a storage backend.
 /// like webdav, directory, s3, ...
 ///
@@ -140,7 +181,7 @@ pub struct Config {
     http_path: Option<String>,
 
     /// Store extensions at webdav target
-    #[arg(long, help = "Ignore tls/https errors")]
+    #[arg(long, action=clap::ArgAction::SetTrue, help = "Ignore tls/https errors")]
     insecure: bool,
 
     /// Overwrite the detected user with specified
@@ -538,7 +579,11 @@ fn store_to_maildir(path: &Path, content: &str, target: &str, flags: &Vec<String
     //let res = backend.email_add(target, content.as_bytes(), flags);
     match res {
         Ok(_) => {
-            log::info!("Maildir message was stored: {}", &id);
+            log::info!(
+                "Maildir message was stored. Mailbox: {} Id: {} ",
+                &target,
+                &id
+            );
             Ok(())
         }
         Err(e) => {
@@ -549,7 +594,13 @@ fn store_to_maildir(path: &Path, content: &str, target: &str, flags: &Vec<String
 }
 
 /// Stores mail in a maildir target
-fn store_to_imap(server: &str, content: &str, target: &str, flags: &Vec<String>) -> Result<()> {
+fn store_to_imap(
+    server: &str,
+    content: &str,
+    target: &str,
+    flags: &Vec<String>,
+    insecure: bool,
+) -> Result<()> {
     let conn_info = Url::parse(server).context("Can't parse imap target URL")?;
 
     let domain = conn_info
@@ -563,11 +614,30 @@ fn store_to_imap(server: &str, content: &str, target: &str, flags: &Vec<String>)
         // certificate is valid for the domain we're connecting to.
         //let client = async_imap::connect((domain, port), domain, tls).await?;
         let stream = TcpStream::connect((domain, port))?;
-        let tls = RustlsConnector::default();
-        let tls_stream = tls.connect(&domain, stream)?;
+        let mut root_store = rustls::RootCertStore::empty();
+        for cert in rustls_native_certs::load_native_certs().expect("could not load platform certs")
+        {
+            if let Err(err) = root_store.add(&rustls::Certificate(cert.0)) {
+                log::warn!(
+                    "Got error while importing some native certificates: {:?}",
+                    err
+                );
+            }
+        }
 
-        // we pass in the domain twice to check that the server's TLS
-        // certificate is valid for the domain we're connecting to.
+        let mut options = rustls::client::ClientConfig::builder()
+            .with_safe_defaults()
+            .with_root_certificates(root_store)
+            .with_no_client_auth();
+        if insecure {
+            options
+                .dangerous()
+                .set_certificate_verifier(std::sync::Arc::new(NoCertificateVerification {}));
+        }
+
+        let client_connection = rustls::ClientConnection::new(options.into(), domain.try_into()?)?;
+        let tls_stream = rustls::StreamOwned::new(client_connection, stream);
+
         let client = imap::Client::new(tls_stream);
 
         // the client we have here is unauthenticated.
@@ -579,7 +649,10 @@ fn store_to_imap(server: &str, content: &str, target: &str, flags: &Vec<String>)
         let pass = conn_info
             .password()
             .ok_or(anyhow!("IMAP password not set"))?;
-        let imap_session = client.login(conn_info.username(), pass).map_err(|e| e.0)?;
+        let imap_session = client.login(conn_info.username(), pass).map_err(|e| {
+            log::error!("IMAP login failed: {:?}", e);
+            e.0
+        })?;
         imap_session
     } else {
         bail!("Only imaps is supported")
@@ -593,7 +666,8 @@ fn store_to_imap(server: &str, content: &str, target: &str, flags: &Vec<String>)
 
     // we want to fetch the first email in the INBOX mailbox
     let mut select = imap_session.select(&mailbox_name);
-    if let Err(err) = &select {
+    if let Err(_err) = &select {
+        // could not select mailbox, try to create it
         log::info!("Creating target folder:  {}", &mailbox_name);
 
         let create_result = imap_session.create(&mailbox_name);
@@ -615,6 +689,8 @@ fn store_to_imap(server: &str, content: &str, target: &str, flags: &Vec<String>)
     if let Err(err) = append {
         log::error!("Can't append to target folder: {} {}", &mailbox_name, err);
         bail!("Can't append to target folder: {}", err);
+    } else {
+        log::info!("Message stored in mailbox: {}", &mailbox_name);
     }
 
     Ok(())
@@ -633,7 +709,7 @@ async fn store_message(
     }
     if let Some(imap_url) = &config.imap_url {
         // wrap in async runner
-        return store_to_imap(imap_url, content, target, flags);
+        return store_to_imap(imap_url, content, target, flags, config.insecure);
     }
     Ok(())
 }
@@ -943,6 +1019,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore]
     async fn test_webdav_integration() {
         let target = std::env::var("TARGET").unwrap_or("localhost".into());
         let http_target = format!("http://test:testme@{}:4918/", target);
@@ -954,6 +1031,7 @@ mod tests {
             verbose: 3,
             insecure: true,
             output_template: DEFAULT_OUTPUT_TEMPLATE.into(),
+            mail_template: DEFAULT_MAIL_TEMPLATE.into(),
             ..Config::default()
         };
         setup_logging(&config);

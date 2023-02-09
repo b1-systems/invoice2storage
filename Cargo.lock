@@ -799,7 +799,7 @@ dependencies = [
 
 [[package]]
 name = "invoice2storage"
-version = "0.1.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "backoff",
@@ -814,7 +814,8 @@ dependencies = [
  "object_store",
  "reqwest",
  "resolve-path",
- "rustls-connector",
+ "rustls",
+ "rustls-native-certs",
  "serde",
  "stderrlog",
  "tera",
@@ -1437,18 +1438,6 @@ dependencies = [
  "log",
  "ring",
  "sct",
- "webpki",
-]
-
-[[package]]
-name = "rustls-connector"
-version = "0.16.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9c6a18f8d10f71bce9bca6eaeb80429460e652f3bcf0381f0c5f8954abf7b3b8"
-dependencies = [
- "log",
- "rustls",
- "rustls-native-certs",
  "webpki",
 ]
 
