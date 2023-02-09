@@ -1,0 +1,18 @@
+# Custom Dictionary Words
+addrparse
+backoff
+ctype
+imaps
+Invoice2storage
+Maildir
+mailparse
+mimetypes
+myflag
+Poelzleithner
+repr
+rsplit
+Rustls
+stderrlog
+Tera
+walkdir
+webdav

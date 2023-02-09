@@ -351,7 +351,18 @@ async fn extract_files(
                 //let path = tt.render("output", &context)?;
                 let rendered = tt.render_str(&config.output_template, &context);
                 let path = match rendered {
-                    Ok(x) => x,
+                    Ok(x) => {
+                        if x.trim().is_empty() {
+                            log::error!(
+                                "The template: \"{}\" rendered into an empty string: {}",
+                                &config.output_template,
+                                &x
+                            );
+                            errors += 1;
+                            continue;
+                        }
+                        x
+                    }
                     Err(e) => {
                         log::error!("Error rendering output path: {}", e);
                         errors += 1;
@@ -469,6 +480,8 @@ pub fn extract_user(message: &ParsedMail) -> Option<String> {
 /// Creates the object_store to save objects to.
 fn create_object_store(config: &Config) -> Result<Box<dyn object_store::ObjectStore>> {
     if let Some(local_path) = &config.local_path {
+        // this should not be blocking
+        std::fs::create_dir_all(local_path)?;
         return Ok(Box::new(
             object_store::local::LocalFileSystem::new_with_prefix(local_path)?,
         ));
@@ -741,6 +754,11 @@ async fn main() -> ExitCode {
     // println!("Config: {:?}", &config);
 
     setup_logging(&config);
+
+    if config.insecure {
+        log::warn!("Insecure mode enabled. Certificates will not be verified.");
+    }
+
     let result = run(&config).await;
 
     if result.is_success() {
@@ -964,6 +982,24 @@ mod tests {
         assert_eq!(flags2maildir(&flags2), "Fm".to_owned());
     }
 
+    fn count_mails(maildir_path: &Path) -> usize {
+        let mut found = 0;
+        for entry in walkdir::WalkDir::new(maildir_path)
+            .follow_links(true)
+            .into_iter()
+            .filter_map(|e| e.ok())
+        {
+            let f_name = entry.file_name().to_string_lossy();
+            if entry.file_type().is_file()
+                && f_name.contains(":2,")
+                && entry.path().to_string_lossy().contains("test1.done")
+            {
+                found += 1;
+            }
+        }
+        found
+    }
+
     #[tokio::test]
     async fn test_local_integration() {
         let dir = std::env::temp_dir();
@@ -979,6 +1015,8 @@ mod tests {
             ..Config::default()
         };
         setup_logging(&config);
+        let maildir_path2 = maildir_path.clone();
+        let checkmail_pre = tokio::task::spawn_blocking(move || count_mails(&maildir_path2)).await;
         let res1 = run(&config).await;
         assert_eq!(res1.num_errors, 0);
         assert_eq!(res1.files, vec!["test1/sample1.pdf".to_owned()]);
@@ -988,25 +1026,9 @@ mod tests {
         assert!(out_path.exists());
         assert_eq!(std::fs::remove_file(&out_path).unwrap(), ());
         // check if mail was delivered correctly into the proper maildir folder
-        let checkmail = tokio::task::spawn_blocking(move || {
-            let mut found = 0;
-            for entry in walkdir::WalkDir::new(maildir_path)
-                .follow_links(true)
-                .into_iter()
-                .filter_map(|e| e.ok())
-            {
-                let f_name = entry.file_name().to_string_lossy();
-                if entry.file_type().is_file()
-                    && f_name.contains(":2,")
-                    && entry.path().to_string_lossy().contains("test1.done")
-                {
-                    found += 1;
-                }
-            }
-            found
-        })
-        .await;
-        assert_eq!(checkmail.unwrap(), 1);
+        let maildir_path3 = maildir_path.clone();
+        let checkmail_post = tokio::task::spawn_blocking(move || count_mails(&maildir_path3)).await;
+        assert_eq!(checkmail_pre.unwrap() + 1, checkmail_post.unwrap());
 
         config.file = "test-data/test_email_no_plus.eml".to_owned();
         let res2 = run(&config).await;
@@ -1024,7 +1046,7 @@ mod tests {
         let target = std::env::var("TARGET").unwrap_or("localhost".into());
         let http_target = format!("http://test:testme@{}:4918/", target);
         let imap_target = format!("imaps://test:testme@{}/", target);
-        let mut config = Config {
+        let config = Config {
             file: "test-data/test_email1.eml".to_owned(),
             http_path: Some(http_target.clone()),
             imap_url: Some(imap_target.clone()),

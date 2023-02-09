@@ -1,0 +1,24 @@
+Content-Type: multipart/mixed; boundary="------------7jI51bEoWAoWq71eosh3kDLB"
+Message-ID: <8431b952-2042-ba89-cf43-aaa2773eba93@b1-systems.de>
+Date: Tue, 7 Feb 2023 15:52:10 +0100
+MIME-Version: 1.0
+User-Agent: Mozilla/5.0 (X11; Linux x86_64; rv:102.0) Gecko/20100101
+ Thunderbird/102.5.1
+Content-Language: en-US
+To: Daniel Poelzleithner <poelzleithner@b1-systems.de>
+From: Daniel Poelzleithner <poelzleithner@b1-systems.de>
+Subject: Your Invoice for Testdata
+
+This is a multi-part message in MIME format.
+--------------7jI51bEoWAoWq71eosh3kDLB
+Content-Type: text/plain; charset=UTF-8; format=flowed
+Content-Transfer-Encoding: 7bit
+
+Dear Testsystem,
+
+I present to you a invoice to extract.
+
+kind regards
+  Your Programmer
+
+--------------7jI51bEoWAoWq71eosh3kDLB--

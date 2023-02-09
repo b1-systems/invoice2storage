@@ -38,52 +38,6 @@ You can add this repository to your NixOS flake configuration.
 All settings can be passed through command line arguments or put into a yaml file.
 See `--help` for a full list of options.
 
-```bash
-A email processor to extract email attachments and store them on a storage backend. like webdav, directory, s3, ...
-
-Usage: invoice2storage [OPTIONS] [FILE]
-
-Arguments:
-  [FILE]  File to extract [default: -]
-
-Options:
-      --config-file <CONFIG_FILE>
-          Config file to load [default: ~/.config/invoice2storage/config.toml]
-      --unknown-user <UNKNOWN_USER>
-          user name for unknown user [default: _UNKNOWN]
-      --accepted-mimetypes <ACCEPTED_MIMETYPES>
-          [default: application/pdf]
-  -v, --verbose...
-          Increase verbosity
-  -q, --quiet
-          Silence all output
-      --local-path [<LOCAL_PATH>]
-          Local path to save extensions to [env: LOCAL_PATH=]
-      --http-path [<HTTP_PATH>]
-          Store extensions at webdav target [env: HTTP_PATH=]
-      --insecure <INSECURE>
-          Ignore tls/https errors [possible values: true, false]
-      --overwrite-user [<OVERWRITE_USER>]
-          Overwrite the detected user with specified
-      --stdout <STDOUT>
-          Pipe mail to stdout. Useful when used as a pipe filter [possible values: true, false]
-      --output-template <OUTPUT_TEMPLATE>
-          template for file output path [env: OUTPUT_TEMPLATE=] [default: "{{user | lower}}/{{file_name | escape_filename}}"]
-      --maildir-path [<MAILDIR_PATH>]
-          Maildir folder to save messages to, instead of imap [env: MAILDIR_PATH=]
-      --imap-url [<IMAP_URL>]
-          IMAP connection url. imaps://user:password@host [env: IMAP_URL=]
-      --mail-template <MAIL_TEMPLATE>
-          Mail template folder [env: MAIL_TEMPLATE=] [default: "{{user | lower}}.{% if errors %}new{% else %}done{% endif %}"]
-      --success-flags <SUCCESS_FLAGS>
-          Mail flags in success case [env: SUCCESS_FLAGS=] [default: ]
-      --error-flags <ERROR_FLAGS>
-          Mail flags in error cases [env: ERROR_FLAGS=] [default: \Flag]
-  -h, --help
-          Print help
-  -V, --version
-          Print version
-```
 
 ## MTA configuration
 
@@ -117,3 +71,18 @@ env RUST_BACKTRACE=1 TARGET=10.0.42.158  /home/poelzi/b1/invoice2storage/scripts
 ```
 
 The environment variables `TARGET` is the VM address.
+
+### Suggested VSCode workspace settings
+
+```json
+   "cSpell.customDictionaries": {
+      "custom-dictionary-workspace": {
+         "name": "custom-dictionary-workspace",
+         "path": "${workspaceFolder:invoice2storage}/.cspell/custom-dictionary-workspace.txt",
+         "addWords": true,
+         "scope": "workspace"
+      }
+   },
+   "rust-analyzer.runnables.command": "${workspaceFolder}/scripts/nix-cargo",
+   "cargo.automaticCheck": false,
+```
