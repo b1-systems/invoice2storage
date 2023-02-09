@@ -42,7 +42,7 @@ const DEFAULT_CONFIG_FILE: &'static str = "~/.config/invoice2storage/config.toml
 const DEFAULT_EXTRACT_MIMES: [&'static str; 1] = ["application/pdf"];
 const UNKNOWN_USER_DEFAULT: &'static str = "_UNKNOWN";
 const UNKNOWN_FROM_DEFAULT: &'static str = "UNKNOWN";
-const DEFAULT_PATH_TEMPLATE: &'static str = "{{user | lower}}/{{file_name | escape_filename}}";
+const DEFAULT_OUTPUT_TEMPLATE: &'static str = "{{user | lower}}/{{file_name | escape_filename}}";
 const DEFAULT_MAIL_TEMPLATE: &'static str =
     "{{user | lower}}.{% if errors %}new{% else %}done{% endif %}";
 const DEFAULT_FILE_NAME: &'static str = "-";
@@ -112,7 +112,7 @@ struct Args {
     pub config: <Config as ClapSerde>::Opt,
 }
 
-#[derive(ClapSerde)]
+#[derive(ClapSerde, Debug)]
 pub struct Config {
     /// user name for unknown user
     #[arg(long, default_value = {UNKNOWN_USER_DEFAULT.to_string()})]
@@ -152,7 +152,7 @@ pub struct Config {
     stdout: bool,
 
     /// Target path for generated file
-    #[arg(long, env, default_value = {DEFAULT_PATH_TEMPLATE.to_owned()}, help = "template for file output path")]
+    #[arg(long, env, default_value = {DEFAULT_OUTPUT_TEMPLATE.to_owned()}, help = "template for file output path")]
     output_template: String,
 
     /// Maildir output
@@ -182,6 +182,37 @@ pub struct Config {
 
     #[arg(long, env, default_value = DEFAULT_ERROR_FLAGS, help = "Mail flags in error cases")]
     error_flags: Vec<String>,
+}
+
+#[derive(Debug, Default)]
+pub struct ProcessResult {
+    num_errors: u32,
+    files: Vec<String>,
+    user: Option<String>,
+    mailbox: Option<String>,
+}
+
+impl ProcessResult {
+    pub fn is_success(&self) -> bool {
+        self.num_errors == 0
+    }
+}
+
+impl Display for ProcessResult {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Process result: {}. {} files processed, user: {}, mailbox: {}",
+            if self.is_success() {
+                "success"
+            } else {
+                "failure"
+            },
+            self.files.len(),
+            self.user.clone().unwrap_or("[unknown]".into()),
+            self.mailbox.clone().unwrap_or("[unknown]".into())
+        )
+    }
 }
 
 /// Returns the given text that is safe to use as a filename.
@@ -249,7 +280,6 @@ async fn extract_files(
         if accepted_mimetypes.0.contains(&subpart.ctype.mimetype) {
             let content = &subpart.get_content_disposition();
             if content.disposition == DispositionType::Attachment {
-                println!("{:?}", content.params);
                 let filename: String = content
                     .params
                     .get("filename")
@@ -564,7 +594,6 @@ fn store_to_imap(server: &str, content: &str, target: &str, flags: &Vec<String>)
     // we want to fetch the first email in the INBOX mailbox
     let mut select = imap_session.select(&mailbox_name);
     if let Err(err) = &select {
-        println!("Err {:?}", err);
         log::info!("Creating target folder:  {}", &mailbox_name);
 
         let create_result = imap_session.create(&mailbox_name);
@@ -633,15 +662,22 @@ async fn main() -> ExitCode {
         // If there is not config file return only config parsed from clap
         Config::from(&mut args.config)
     };
+    // println!("Config: {:?}", &config);
 
-    // configure logging
-    stderrlog::new()
-        .module(module_path!())
-        .quiet(config.quiet)
-        .verbosity(config.verbose as usize)
-        .timestamp(stderrlog::Timestamp::Second)
-        .init()
-        .unwrap();
+    setup_logging(&config);
+    let result = run(&config).await;
+
+    if result.is_success() {
+        log::info!("{}", result);
+        ExitCode::SUCCESS
+    } else {
+        log::error!("{}", result);
+        ExitCode::from(1)
+    }
+}
+
+pub async fn run(config: &Config) -> ProcessResult {
+    let mut rv = ProcessResult::default();
 
     let mut content: String = String::new();
 
@@ -676,16 +712,25 @@ async fn main() -> ExitCode {
                 user_found = true;
             };
             let user_option = if user_found { Some(user.clone()) } else { None };
+            rv.user = user_option.clone();
             let res = extract_files(&message, &config, &user_option).await;
 
             match &res {
                 Ok((files, errors)) => {
                     path_name_context.insert("errors", errors);
-                    path_name_context.insert("files", files);
-                    log::info!("Found {} files for user {}", files.len(), &user);
+                    path_name_context.insert("num_files", &files.len());
+                    path_name_context.insert("files", &files);
+                    log::info!(
+                        "Found {} files for user {}. {} Errors",
+                        files.len(),
+                        &user,
+                        errors
+                    );
                     if errors > &0 {
                         has_errors = true;
                     }
+                    rv.files = files.clone();
+                    rv.num_errors = *errors;
                 }
                 Err(e) => {
                     log::error!("Error: {}", e);
@@ -754,15 +799,30 @@ async fn main() -> ExitCode {
         let res = handle.write_all(content.as_bytes());
         if res.is_err() {
             log::error!("Can't write to stdout: {}", res.err().unwrap());
-            return ExitCode::from(1);
+            rv.num_errors += 1;
         }
     };
-    ExitCode::SUCCESS
+    rv
+}
+
+pub fn setup_logging(config: &Config) {
+    // configure logging
+    let logging = stderrlog::new()
+        .module(module_path!())
+        .quiet(config.quiet)
+        .verbosity(config.verbose as usize)
+        .timestamp(stderrlog::Timestamp::Second)
+        .init();
+
+    if let Err(err) = &logging {
+        println!("Error setting up logging: {}", err);
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use walkdir;
 
     #[test]
     fn test_user_extraction() {
@@ -826,5 +886,89 @@ mod tests {
 
         let flags2 = vec!["\\Flagged".to_owned(), "m".to_owned()];
         assert_eq!(flags2maildir(&flags2), "Fm".to_owned());
+    }
+
+    #[tokio::test]
+    async fn test_local_integration() {
+        let dir = std::env::temp_dir();
+        let files_path = dir.join("files");
+        let maildir_path = dir.join("maildir");
+        let mut config = Config {
+            file: "test-data/test_email1.eml".to_owned(),
+            local_path: Some(files_path.clone()),
+            verbose: 3,
+            output_template: DEFAULT_OUTPUT_TEMPLATE.into(),
+            mail_template: DEFAULT_MAIL_TEMPLATE.into(),
+            maildir_path: Some(maildir_path.clone()),
+            ..Config::default()
+        };
+        setup_logging(&config);
+        let res1 = run(&config).await;
+        assert_eq!(res1.num_errors, 0);
+        assert_eq!(res1.files, vec!["test1/sample1.pdf".to_owned()]);
+        assert_eq!(res1.user, Some("test1".to_owned()));
+        assert!(files_path.exists());
+        let out_path = files_path.join("test1/sample1.pdf");
+        assert!(out_path.exists());
+        assert_eq!(std::fs::remove_file(&out_path).unwrap(), ());
+        // check if mail was delivered correctly into the proper maildir folder
+        let checkmail = tokio::task::spawn_blocking(move || {
+            let mut found = 0;
+            for entry in walkdir::WalkDir::new(maildir_path)
+                .follow_links(true)
+                .into_iter()
+                .filter_map(|e| e.ok())
+            {
+                let f_name = entry.file_name().to_string_lossy();
+                if entry.file_type().is_file()
+                    && f_name.contains(":2,")
+                    && entry.path().to_string_lossy().contains("test1.done")
+                {
+                    found += 1;
+                }
+            }
+            found
+        })
+        .await;
+        assert_eq!(checkmail.unwrap(), 1);
+
+        config.file = "test-data/test_email_no_plus.eml".to_owned();
+        let res2 = run(&config).await;
+        assert_eq!(res2.num_errors, 0);
+        assert_eq!(res2.user, Some("user1".to_owned()));
+        assert_eq!(res2.files, vec!["user1/sample2.pdf".to_owned()]);
+        let out_path = files_path.join("user1/sample2.pdf");
+        assert!(out_path.exists());
+        assert_eq!(std::fs::remove_file(&out_path).unwrap(), ());
+    }
+
+    #[tokio::test]
+    async fn test_webdav_integration() {
+        let target = std::env::var("TARGET").unwrap_or("localhost".into());
+        let http_target = format!("http://test:testme@{}:4918/", target);
+        let imap_target = format!("imaps://test:testme@{}/", target);
+        let mut config = Config {
+            file: "test-data/test_email1.eml".to_owned(),
+            http_path: Some(http_target.clone()),
+            imap_url: Some(imap_target.clone()),
+            verbose: 3,
+            insecure: true,
+            output_template: DEFAULT_OUTPUT_TEMPLATE.into(),
+            ..Config::default()
+        };
+        setup_logging(&config);
+        log::info!(
+            "Using TARGET={}, use environment variable to change",
+            target
+        );
+        let res1 = run(&config).await;
+        assert_eq!(res1.num_errors, 0);
+        assert_eq!(res1.files, vec!["test1/sample1.pdf".to_owned()]);
+        assert_eq!(res1.user, Some("test1".to_owned()));
+
+        // check if the file was created at the webdav server
+        let check_url = format!("{}/{}", &http_target, "test1/sample1.pdf");
+        let req = reqwest::get(&check_url).await;
+        assert!(req.is_ok());
     }
 }
