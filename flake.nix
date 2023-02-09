@@ -45,6 +45,10 @@
           MINIO_ROOT_USER=test
           MINIO_ROOT_PASSWORD=testme
         '';
+        # user is test / testme
+        htpasswd-credentials = pkgs.writeText "/etc/htpasswd" ''
+          test:G5mNd21eREcPo
+        '';
       in let
         # main invoice2storage derivative
         invoice2storage = naersk-lib.buildPackage {
@@ -69,6 +73,7 @@
                 environment.systemPackages = [
                   pkgs.cargo
                   pkgs.rustc
+                  pkgs.libressl
                 ] ++ extra_packages;
                 # Network configuration.
                 networking = {
@@ -79,11 +84,16 @@
 
                 services.dovecot2 = {
                   enable = true;
+                  mailLocation = "maildir:~/mail";
+                  sslServerKey = "/etc/ssl/certs/key.pem";
+                  sslServerCert = "/etc/ssl/certs/cert.pem";
                 };
 
                 services.postfix = {
                   enable = true;
                 };
+
+                services.openssh.enable = true;
 
                 services.minio = {
                   enable = true;
@@ -91,10 +101,37 @@
                   rootCredentialsFile = minio-credentials;
                 };
 
+                services.webdav-server-rs = {
+                  enable = true;
+                  user = "test";
+                  # debug = true;
+                  settings = {
+                    server.listen = [ "0.0.0.0:4918" "[::]:4918" ];
+                    accounts = {
+                      auth-type = "htpasswd.default";
+                      acct-type = "unix";
+                    };
+                    htpasswd.default = {
+                      htpasswd = htpasswd-credentials;
+                    };
+                    location = [
+                      {
+                        route = [ "/*path" ];
+                        directory = "/home/test/webdav";
+                        handler = "filesystem";
+                        methods = [ "webdav-rw" ];
+                        autoindex = true;
+                        auth = "write";
+                      }
+                    ];
+                  };
+                };
+
                 users.users.test = {
-                  password = "test";
+                  password = "testme";
                   group = "test";
-                  extraGroups = [ "sudo" ];
+                  uid = 1000;
+                  extraGroups = [ "wheel" ];
                   isNormalUser = true;
                 };
                 users.groups.test = {};
@@ -110,6 +147,31 @@
                   };
                 };
                 services.getty.autologinUser = "test";
+
+                systemd.services."create-ssl-cert" = {
+                  description = "Create a certificate for ssl";
+
+                  script = ''
+                    ${pkgs.libressl}/bin/openssl req -x509 -newkey rsa:4096 -keyout key.pem -out cert.pem -days 365 -nodes -subj '/CN=localhost'
+                    chmod 644 cert.pem
+                    chmod 640 key.pem
+                    chown ssl.ssl key.pem cert.pem
+                  '';
+
+                  wantedBy = [ "multi-user.target" "nginx.service" "dovecot2.service"];
+
+                  unitConfig = {
+                    Before = [ "multi-user.target" "nginx.service" ]  ;
+                    ConditionPathExists = "!/etc/ssl/certs/cert.pem";
+                  };
+
+                  serviceConfig = {
+                    User = "root";
+                    Type = "oneshot";
+                    WorkingDirectory = "/etc/ssl/certs";
+                    RemainAfterExit = true;
+                  };
+                };
                 # services.greetd = {
                 #   enable = true;
                 #   settings = {
