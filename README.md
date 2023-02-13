@@ -1,13 +1,15 @@
 # Invoice2storage
 
-Easy handling for invoices in cooperate environments.
+Easy handling for invoices in cooperate environments with a central place to collect invoices.
 
-Workflow:
+**Workflow**:
 
-Each user gets a folder accessible for the office. Users can forward their invoices
-to a special email address like invoice+bob.allen@example.com
+Each user/employee gets a folder accessible for the office. Users can forward their invoices
+to a personalized email address like invoice+bob.allen@example.com
 
-The office has one place where all invoices are collected.
+Invoice2storage extracts the attached files from the email, determines the user and stores the files in the users directory.
+
+The office has one place where all invoices are collected, sorted by user (can be customized).
 
 ## Operation
 
@@ -22,6 +24,8 @@ This script is used a a email filter to process incoming invoice emails.
 5. It stores the email in the folder and backend configured
 
 ## Installation
+
+The suggested architecture is to run invoice2storage on the EMail-server, that stores the Maildir/IMAP folders. Invoice2storage can store the emails in `maildir` or `imap` folders.
 
 ### Using cargo
 
